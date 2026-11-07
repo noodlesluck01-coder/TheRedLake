@@ -1,490 +1,503 @@
--- ================================================================
--- BIOSYN AUTO-FARM  |  SCP: The Red Lake  |  v2 (hardened boot)
--- Separate from the BIOSYN hub - does not touch it.
+-- [[ Rscripts Risk Notice ]]
+-- This script is not verified by rscripts.net. Deal with caution.
 --
--- RULES (yours):
---   * GUN ONLY - melee tools are never equipped or fired
---   * NEVER uses your abilities/class powers (no key presses at all:
---     everything runs on mouse clicks and remotes only)
---   * Loop: deploy -> camp at the ammo box -> claim ammo -> kill aura
---     -> auto card pick (infinite ammo first) -> 350-streak auto reset
---   * No workspace-wide scans (no VM freezes / crashes)
--- ================================================================
+-- Stay safe:
+--   • Never log in on unofficial Roblox sites or lookalike domains.
+--   • Real Roblox links use roblox.com (check the .com ending).
+--   • Treat fake Roblox login / "claim reward" pages as phishing.
+-- [[ End Rscripts Risk Notice ]]
+--
+-- Improved version:
+--   * Instant Proximity Prompt: auto-loaded from scriptblox (user's pick)
+--     every time the hub opens — no UI button anymore
+--   * Silent Aim / Kill Closest: loops actually STOP on toggle off (the old ones
+--     never stopped and stacked = lag), fire rate throttled instead of 60x/sec
+--   * Enemy ESP: single update loop, safe highlight cleanup
 
-local genv = (getgenv and getgenv()) or _G
-genv.BIOSYN_FARM_RUN_ID = (genv.BIOSYN_FARM_RUN_ID or 0) + 1
-local RUN_ID = genv.BIOSYN_FARM_RUN_ID
-genv.BIOSYN_FARM_CLEANUP = genv.BIOSYN_FARM_CLEANUP or {}
-for _, c in ipairs(genv.BIOSYN_FARM_CLEANUP) do
-    pcall(function() c:Disconnect() end)
+local okLib, library = pcall(function()
+    local src = game:HttpGet("https://raw.githubusercontent.com/deeeity/mercury-lib/master/src.lua")
+    -- set the toggle key to K from the start (library defaults to Delete)
+    src = src:gsub("Keybind = Enum.KeyCode.Delete", "Keybind = Enum.KeyCode.K", 1)
+    return loadstring(src)()
+end)
+if not okLib or not library then
+    warn("[notveryuhq] Mercury UI failed to load: " .. tostring(library))
+    return
 end
-genv.BIOSYN_FARM_CLEANUP = {}
-
-local Players = game:GetService("Players")
-local Teams = game:GetService("Teams")
-local plr = Players.LocalPlayer
-local teamPlayers = Teams:FindFirstChild("Players")
-local teamLobby = Teams:FindFirstChild("Lobby")
-
-print("[farm v2] step1 - started")
 
 -- ================================================================
--- SETTINGS (diff/map/versus/ally persist to a json file so your
--- Brutal/Forest/On/GOC picks survive every reload)
+-- WINDOW (Legacy theme: dark + purple accent)
 -- ================================================================
-local CFG_FILE = "biosyn_farm_cfg.json"
-local cfg = {
-    difficulty = "Brutal", -- fallback default = your last standing pick
-    map = "Forest",
-    versus = "On",
-    ally = "GOC",        -- ALLY vote faction: GOC / MCD / UIU / None / Any=manual
-    deathwish = "Any",   -- DEATH WISH vote: On / Off / Any = leave it manual
-    autoWeapons = true,  -- auto-equip a gun from the Backpack (melee never)
-    autoCards = true,    -- auto-pick upgrade cards, priority: infinite ammo
-    attackRate = 0.015,  -- hub kill-aura cadence (~66 packets/s, accepted)
-    resupplyAt = 10,     -- reserve <= this: step beside box and claim
-}
+local window = library:create{ Theme = library.Themes.Legacy }
+_G.BIOSYN_WINDOW = window   -- exposed: the ⬡ toggle + external tools use this
 
--- restore saved picks (a saved file overrides the defaults above)
-pcall(function()
-    local data = game:GetService("HttpService"):JSONDecode(readfile(CFG_FILE))
-    if type(data) == "table" then
-        local keys = { difficulty = 1, map = 1, versus = 1, ally = 1, deathwish = 1,
-            autoWeapons = 1, autoCards = 1, resupplyAt = 1 }
-        for k in pairs(keys) do
-            if data[k] ~= nil and type(data[k]) == type(cfg[k]) then
-                cfg[k] = data[k]
+-- ================================================================
+-- MAIN TABS
+-- ================================================================
+local combatTab = window:tab{ Name = "Combat", Icon = "rbxassetid://6034996695" }
+local visualsTab = window:tab{ Name = "Visuals", Icon = "rbxassetid://6034996695" }
+local miscTab = window:tab{ Name = "Misc", Icon = "rbxassetid://6034996695" }
+
+-- ================================================================
+-- OPEN ONLY Combat / Visuals / Misc AT START
+-- Mercury hides tab buttons until you click a quick-access icon on
+-- the home page. Reveal just our 3 tabs in the nav bar and open
+-- Combat. Settings / Credits are NOT deleted: they stay reachable
+-- through the home-page gear / credits icons, but their nav buttons
+-- are kept hidden — even if something tries to reveal them later.
+-- ================================================================
+local startupOk, startupErr = pcall(function()
+    local wanted = { Combat = true, Visuals = true, Misc = true }
+    local nav = window.navigation.AbsoluteObject
+    local nilFolder = window.nilFolder and window.nilFolder.AbsoluteObject
+    local activePage = nil
+
+    for _, info in ipairs(window.Tabs) do
+        local page, btn, name = info[1], info[2], info[3]
+        if name and wanted[name] then
+            -- reveal only our 3 tab buttons in the nav bar
+            btn.Parent = nav
+            btn.Visible = true
+            if name == "Combat" then
+                activePage = page
+            end
+        elseif name then
+            -- Settings / Credits: pull out of the nav and keep hidden.
+            -- If the home-page gear/credits icon reveals them again the
+            -- button is hidden instantly — the page itself still opens,
+            -- so Settings/Credits remain fully usable.
+            pcall(function()
+                btn.Visible = false
+                if nilFolder then
+                    btn.Parent = nilFolder
+                end
+                btn:GetPropertyChangedSignal("Visible"):Connect(function()
+                    if btn.Visible then
+                        task.defer(function()
+                            btn.Visible = false
+                        end)
+                    end
+                end)
+            end)
+        end
+    end
+
+    -- fallback: first wanted tab if Combat wasn't found
+    if not activePage then
+        for _, info in ipairs(window.Tabs) do
+            if wanted[info[3]] then
+                activePage = info[1]
+                break
             end
         end
     end
-end)
 
--- save the picks right after every dropdown change (silent no-op on
--- executors without file io: the farm keeps working, just no persistence)
-local function saveCfg()
+    -- show only the active page (pages overlap, so only one can show)
+    for _, info in ipairs(window.Tabs) do
+        if info[3] then
+            info[1].Visible = (info[1] == activePage)
+        end
+    end
+    if window.homePage then
+        window.homePage.Visible = false
+    end
+
+    -- selected button = solid, the rest = transparent
+    for _, info in ipairs(window.Tabs) do
+        local page, btn, name = info[1], info[2], info[3]
+        if name and wanted[name] then
+            btn.BackgroundTransparency = (page == activePage) and 0 or 1
+        end
+    end
+
+    -- deselect the home button so only Combat reads as active
+    if window.homeButton then
+        window.homeButton.BackgroundTransparency = 1
+    end
+
+    -- keep the address bar in sync
     pcall(function()
-        writefile(CFG_FILE, game:GetService("HttpService"):JSONEncode({
-            difficulty = cfg.difficulty,
-            map = cfg.map,
-            versus = cfg.versus,
-            ally = cfg.ally,
-            deathwish = cfg.deathwish,
-            autoWeapons = cfg.autoWeapons,
-            autoCards = cfg.autoCards,
-            resupplyAt = cfg.resupplyAt,
-        }))
+        window.UrlLabel.Text = window.Url .. "/combat"
     end)
+end)
+if not startupOk then
+    warn("[notveryuhq] tab reveal failed: " .. tostring(startupErr))
 end
--- auto-resume across reloads: the farm boots in the state it had when the
--- previous instance was replaced (RUNNING reloads as RUNNING)
-local farmOn = (getgenv().BIOSYN_FARM_AUTORESUME == true)
-if farmOn then
-    print("[farm v2] auto-resume: was RUNNING - continuing")
+
+-- ================================================================
+-- SECTION LABELS (Mercury has no Section object — labels divide)
+-- ================================================================
+local aimSection = combatTab
+local tanzaniteSection = combatTab
+local espSection = visualsTab
+local utilitySection = miscTab
+local infoSection = miscTab
+
+-- ================================================================
+-- VARIABLES
+-- ================================================================
+local plr = game.Players.LocalPlayer
+local workspace = game.Workspace
+local players = game.Players
+local runService = game:GetService("RunService")
+local npcFolder = workspace:FindFirstChild("NPCs")
+local uis = game:GetService("UserInputService")
+
+-- ================================================================
+-- FALLBACK fireproximityprompt (fixed: InputHoldStart/Finish)
+-- ================================================================
+if not fireproximityprompt then
+    fireproximityprompt = function(prompt)
+        if not prompt or not prompt:IsA("ProximityPrompt") then return end
+        pcall(function()
+            prompt:InputHoldStart()
+            task.wait(0.05)
+            prompt:InputHoldFinish()
+        end)
+    end
 end
-local stats = { deploys = 0, deaths = 0, shots = 0, claims = 0, picks = 0, resets = 0, kills = 0 }
 
--- farm panel handle registry: automated clicks must never hit OUR OWN
--- buttons (a game button overlapping the panel would toggle the farm off)
-local uiHolder = { handle = nil }
+-- ================================================================
+-- INSTANT PROXIMITY PROMPT — external script (user's pick), auto-run
+-- every time the hub opens. Spawned in its own thread so the Mercury UI
+-- never waits on the HttpGet/scan (zero visible hitch), pcall-guarded.
+-- No UI button anymore: it just runs.
+-- ================================================================
+local INSTANT_PROMPT_URL = "https://scriptblox.com/raw/Universal-Script-Best-Instant-Proximity-Prompt-Script-242054"
+local instantPromptStatus = "loading"
 
--- light perf tweaks (identical lines to the hub, no sweeps)
+-- anti-stutter: lighter slide impact FX + lower graphics baseline (client-side)
 task.spawn(function()
     pcall(function()
-        workspace:SetAttribute("SlideHitFxOff", true)
-        plr:SetAttribute("ScreenEffects", "low")
-    end)
-    pcall(function()
-        game:GetService("Lighting").GlobalShadows = false
-    end)
-    pcall(function() setfpscap(144) end)
-    -- instant proximity prompt (safe: event-based, zero workspace scans)
-    pcall(function()
-        local pps = game:GetService("ProximityPromptService")
-        pps.PromptShown:Connect(function(p)
-            pcall(function()
-                if p:IsA("ProximityPrompt") and p.HoldDuration > 0.4 then
-                    p.HoldDuration = 0.4
-                end
-            end)
+        workspace:SetAttribute("SlideHitFxOff", true)          -- no dust/sound spam on slide impacts (yours and others')
+        plr:SetAttribute("ScreenEffects", "low")               -- halves particle counts for effects that respect it
+        local Lighting = game:GetService("Lighting")
+        Lighting.GlobalShadows = false                         -- big GPU win
+        pcall(function() setfpscap(144) end)                   -- Xeno-only; pcall-guarded
+        pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            ugs.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel5
         end)
     end)
 end)
 
--- ================================================================
--- HELPERS
--- ================================================================
-local function alive()
-    local char = plr.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    return hum ~= nil and hum.Health > 0
-end
-
--- NOT-deployed detection got harder: the update made MenuStage.Enabled
--- false ON the deploy screen, so "menu open" now means: MenuStage enabled
--- OR a real deploy/play bar is on screen. Visibility is checked through
--- the whole ancestor chain (plain .Visible alone lies post-update).
-local function chainVisible(b)
-    local node = b
-    while node and node ~= plr do
-        if node:IsA("GuiObject") then
-            if not node.Visible then return false end
-        elseif node:IsA("ScreenGui") then
-            if not node.Enabled then return false end
+-- anti-stutter: throttle ambient/emitter storm (fog, poison goo, portals,
+-- weapon barrel flames, fireflies). Purely visual — no gameplay effect.
+task.spawn(function()
+    local function matchesAmbient(n)
+        local l = string.lower(n or "")
+        for _, pat in ipairs({ "icy fog", "forest", "poongoo", "goo", "poison", "portal", "spark", "firefly", "fog" }) do
+            if l:find(pat, 1, true) then return true end
         end
-        node = node.Parent
+        return false
+    end
+    local function throttle(root)
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("ParticleEmitter") then
+                local a = d.Parent
+                local b = a and a.Parent
+                local bg = (b and b.Name) or ""
+                local pn = (a and a.Name) or ""
+                -- environmental haze: disable outright
+                if (string.lower(bg):find("icy fog") or string.lower(bg):find("forest") or string.lower(bg):find("fog")) and d.Enabled then
+                    pcall(function() d.Enabled = false end)
+                elseif (matchesAmbient(bg .. pn) or pn == "Particles" or bg == "ToAnimte") and d.Rate > 8 then
+                    pcall(function() d.Rate = 8 end)
+                elseif a and a.Name == "Barrel" and d.Rate > 8 then
+                    pcall(function() d.Rate = 8 end)           -- burning weapon flames
+                end
+            end
+        end
+    end
+    throttle(workspace)
+    -- keep watching for newly spawned ambient emitters while playing
+    local conn
+    conn = workspace.DescendantAdded:Connect(function(d)
+        if d:IsA("ParticleEmitter") then
+            task.delay(0.1, function()
+                if not d.Parent then return end
+                local a = d.Parent
+                local b = a and a.Parent
+                local n = string.lower(((b and b.Name) or "") .. " " .. ((a and a.Name) or ""))
+                if n:find("icy fog") or n:find("forest") or n:find("fog") then
+                    pcall(function() d.Enabled = false end)
+                elseif matchesAmbient(n) or (a and (a.Name == "Particles" or a.Name == "Barrel") or (b and b.Name == "ToAnimte")) then
+                    pcall(function() if d.Rate > 8 then d.Rate = 8 end end)
+                end
+            end)
+        end
+    end)
+    -- drop watchers from previous runs instead of stacking them
+    if _G.BIOSYN_CLEANUP then
+        for _, c in ipairs(_G.BIOSYN_CLEANUP) do
+            pcall(function() c:Disconnect() end)
+        end
+        _G.BIOSYN_CLEANUP = {}
+    else
+        _G.BIOSYN_CLEANUP = {}
+    end
+    table.insert(_G.BIOSYN_CLEANUP, conn)
+end)
+
+task.spawn(function()
+    local okRun, err = pcall(function()
+        local src = game:HttpGet(INSTANT_PROMPT_URL)
+        -- soften the external script: instant 0s hold -> 0.4s hold (guards included)
+        src = src:gsub("HoldDuration%s*=%s*0", "HoldDuration = 0.4")
+        src = src:gsub("HoldDuration%s*~=%s*0", "HoldDuration ~= 0.4")
+        local chunk = loadstring(src)
+        if not chunk then error("loadstring returned nil") end
+        chunk()
+    end)
+    instantPromptStatus = okRun and "on" or ("failed: " .. tostring(err))
+    if okRun then
+        print("[✓] Instant Proximity Prompt: loaded (external)")
+    else
+        warn("[notveryuhq] instant prompt load failed: " .. tostring(err))
+    end
+end)
+
+-- ================================================================
+-- GENERATOR TARGETING (permanent rule, no toggle button)
+-- Every target pick (silent aim, kill closest, axe aura) ranks
+-- enemies by their distance to THE GENERATOR — the thing enemies
+-- actually attack. The generator is auto-found on every map; when a
+-- map has none, everything silently falls back to closest-to-player.
+-- ================================================================
+local generatorRef = nil
+local generatorPos = nil
+local findFailedAt = nil
+
+local function findGenerator()
+    -- fast path known for this game: Workspace.GeneratorFolder.GeneratorPart
+    local folder = workspace:FindFirstChild("GeneratorFolder")
+    if folder then
+        local part = folder:FindFirstChild("GeneratorPart")
+        if part and part:IsA("BasePart") then
+            generatorRef, generatorPos = part, part.Position
+            return true
+        end
+        local any = folder:FindFirstChildWhichIsA("BasePart", true)
+        if any then
+            generatorRef, generatorPos = any, any.Position
+            return true
+        end
+    end
+    -- generic fallback: any generator-named part/model in the map
+    local now = tick()
+    if findFailedAt and (now - findFailedAt) < 10 then
+        return generatorRef ~= nil   -- don't rescan the whole map constantly after a miss
+    end
+    for _, d in ipairs(workspace:GetDescendants()) do
+        local ln = string.lower(d.Name)
+        if ln:find("generator", 1, true)
+            and (d:IsA("BasePart") or d:IsA("Model"))
+            and ln:find("danger", 1, true) == nil
+            and ln:find("manager", 1, true) == nil then
+            if d:IsA("BasePart") then
+                generatorRef, generatorPos = d, d.Position
+                break
+            elseif d:IsA("Model") then
+                local p = d:FindFirstChildWhichIsA("BasePart")
+                if p then
+                    generatorRef, generatorPos = p, p.Position
+                    break
+                end
+            end
+        end
+    end
+    if not generatorRef then
+        findFailedAt = now
+        return false
     end
     return true
 end
 
--- deploy/play bar detector v2 — geometry-driven: scans EVERY enabled
--- ScreenGui (MenuServers "QUICK PLAY" banned by name), finds chain-visible
--- buttons whose own text, NAME, or descendant labels spell deploy / play /
--- redeploy as whole words. Post-update buttons are textless with the word
--- in a child TextLabel (the big red DEPLOY bar), so .Text alone is blind.
-local function findDeployButton(pg)
-    for _, gui in ipairs(pg:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled and gui.Name ~= "MenuServers" then
-            for _, d in ipairs(gui:GetDescendants()) do
-                if (d:IsA("TextButton") or d:IsA("GuiButton")) and chainVisible(d) then
-                    -- ImageButton has NO Text property: raw .Text access
-                    -- crashes the whole scan (that bug made deploy dead).
-                    -- textless red DEPLOY bar = HUD.Root.Safehouse.Deploy.
-                    local txt = " "
-                    if d:IsA("TextButton") then
-                        txt = txt .. string.lower(tostring(d.Text)) .. " "
-                    end
-                    txt = txt .. string.lower(d.Name) .. " "
-                    pcall(function()
-                        for _, c in ipairs(d:GetDescendants()) do
-                            if c:IsA("TextLabel") then
-                                txt = txt .. " " .. string.lower(tostring(c.Text)) .. " "
-                            end
-                        end
-                        -- sibling-label style: the option frame may hold the
-                        -- word label NEXT to the button (voting-card layout)
-                        local par = d.Parent
-                        if par then
-                            txt = txt .. " " .. string.lower(par.Name) .. " "
-                            for _, c in ipairs(par:GetChildren()) do
-                                if c:IsA("TextLabel") then
-                                    txt = txt .. " " .. string.lower(tostring(c.Text)) .. " "
-                                end
-                            end
-                        end
-                    end)
-                    for w in string.gmatch(txt, "%a+") do
-                        if w == "deploy" or w == "play" or w == "redeploy" then
-                            if not txt:find("quick", 1, true)
-                                and not txt:find("squad", 1, true) then
-                                return d
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-        end
+-- make sure the reference is still valid (maps get replaced/destroyed)
+local function ensureGenerator()
+    if not generatorRef or not generatorRef.Parent then
+        generatorRef, generatorPos = nil, nil
+        findGenerator()
     end
-    return nil
 end
 
--- short cache so the 1s camp loop and the 3s deploy loop share one scan
-local deployScan = { t = 0, btn = nil }
-local function getCachedDeploy(pg)
-    if tick() - deployScan.t >= 0.5 then
-        deployScan.btn = findDeployButton(pg)
-        deployScan.t = tick()
+-- new map spawned: a fresh GeneratorFolder appears — notice it cheaply
+workspace.ChildAdded:Connect(function(child)
+    if child.Name == "GeneratorFolder" then
+        findGenerator()
     end
-    return deployScan.btn
-end
-
--- "not deployed" = the character is (still) parked around the safehouse.
--- The map arena is ~25,000 studs away the moment DeployRequest fires, so
--- distance from the safezone is the honest deployed/not-deployed signal
--- (the bottom DEPLOY bar stays visible either way - MenuStage and the bar
--- are both false signals post-update; that caused the fake-teleport camping).
-local function notDeployedNow()
-    local char = plr.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return true end
-    local sz = workspace:FindFirstChild("NewSafehouse")
-    if not sz then return false end
-    local ok, pos = pcall(function() return sz:GetPivot().Position end)
-    if not ok or not pos then return false end
-    return (hrp.Position - pos).Magnitude < 600
-end
-
-local function menuOpen()
-    if notDeployedNow() then return true end
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return true end
-    local ms = pg:FindFirstChild("MenuStage")
-    return (ms and ms.Enabled) and true or false
-end
-
--- click a visible GuiButton with VirtualInputManager (screen coords),
--- getconnections as a fallback bonus. The farm panel is blind during the
--- click so a game button overlapping it can never toggle our own UI.
-local function pressButton(b)
-    if not (b and b.Parent) then return false end
-    local clicked = false
-    local panel = uiHolder.handle
-    pcall(function()
-        if panel and panel.Parent then panel.Enabled = false end
-        local pos, size = b.AbsolutePosition, b.AbsoluteSize
-        if size.Magnitude > 0 and b.Visible then
-            game:GetService("VirtualInputManager"):SendMouseButtonEvent(
-                pos.X + size.X / 2, pos.Y + size.Y / 2, 0, true, game, 1)
-            game:GetService("VirtualInputManager"):SendMouseButtonEvent(
-                pos.X + size.X / 2, pos.Y + size.Y / 2, 0, false, game, 1)
-            clicked = true
-        end
-    end)
-    if not clicked then
-        pcall(function()
-            if getconnections then
-                for _, c in ipairs(getconnections(b.Activated)) do
-                    c:Fire()
-                    clicked = true
-                end
-            end
-        end)
-    end
-    pcall(function()
-        if panel and panel.Parent then panel.Enabled = true end
-    end)
-    return clicked
-end
-
--- find + press a visible button whose text contains a keyword
-local function pressByText(root, words)
-    if not (root and root.Parent) then return false end
-    for _, d in ipairs(root:GetDescendants()) do
-        if (d:IsA("TextButton") or d:IsA("GuiButton")) and d.Visible then
-            local txt = ""
-            pcall(function() txt = string.lower(d.Text or "") end)
-            for _, w in ipairs(words) do
-                if string.find(txt, string.lower(w), 1, true) then
-                    return pressButton(d), d
-                end
-            end
-        end
-    end
-    return false
-end
+end)
+findGenerator()
+print("[✓] Generator targeting: " .. (generatorRef and ("on (" .. tostring(math.floor(generatorPos.X)) .. ", " .. tostring(math.floor(generatorPos.Y)) .. ", " .. tostring(math.floor(generatorPos.Z)) .. ")") or "no generator on this map yet — will auto-find"))
 
 -- ================================================================
--- ENEMY TARGETING (NPCs folder + friendly-fire guard)
--- refreshes fast: 0.5s TTL, nested folders handled, instant retry
--- so freshly spawned enemies are never ignored
+-- FRIENDLY-FIRE GUARD (permanent) — players are NEVER targets.
+-- A teammate who spawned as a lake monster still owns a real Player
+-- Character and gets tagged like an NPC for pathing; without this the
+-- aura/aim/ESP treat him as food. Any model owned by a Player is
+-- skipped everywhere (enemy waves are NPC-owned, they stay targetable).
+-- Hardened: also catches spawned player-owned NPCs (shapeshifter/card
+-- morphs) via attribute ownership links, ObjectValue owners, Friends/
+-- Survivors folders and the "Friend" collection tag.
 -- ================================================================
-local enemyCache = {}
-local cacheTimestamp = 0
-
--- local kill counter: monster Humanoid.Died within 3s of our last shot
--- (the LB_Kills attribute only syncs at match end)
-local killWatch = {}
-local lastShotTarget = nil
-local lastShotTime = 0
-
--- friendly/team-owned guard, same hardened rules as the hub:
--- 1) real Player Character  2) spawned card/shapeshifter monsters keep an
--- ownership link (UserId / player-name / owner attribute / ObjectValue ->
--- Player)  3) friendly collections: NPC-folder Friends/Survivors and
--- "Friend"-tagged models (ally NPCs like GOC soldiers, teammate monsters)
 local function isPlayerOwned(model)
     if not model then return false end
-    local ok, own = pcall(function()
-        return Players:GetPlayerFromCharacter(model)
-    end)
-    if ok and own then return true end
 
+    -- 1) direct player character
+    local ok, owner = pcall(function() return players:GetPlayerFromCharacter(model) end)
+    if ok and owner then return true end
+
+    -- live player lookups (name, display name, user id)
+    local byName, byId = {}, {}
+    pcall(function()
+        for _, p in ipairs(players:GetPlayers()) do
+            byName[p.Name] = true
+            byName[p.DisplayName] = true
+            byId[p.UserId] = true
+        end
+    end)
+
+    -- 2) attribute markers (shapeshifter / card-spawned ownership links)
     local linked = false
     pcall(function()
         for k, v in pairs(model:GetAttributes()) do
             local lk = string.lower(k)
-            if type(v) == "number" and lk:find("userid") then
-                local p = Players:GetPlayerByUserId(tonumber(v) or -1)
-                if p then linked = true end
-            elseif type(v) == "string" and v ~= ""
-                and (lk:find("owner") or lk:find("playername") or lk:find("username")) then
-                if Players:FindFirstChild(v) then linked = true end
-            end
-        end
-        for _, d in ipairs(model:GetChildren()) do
-            if d:IsA("ObjectValue") then
-                local v = d.Value
-                if typeof(v) == "Instance" and v:IsA("Player") then linked = true end
+            if type(v) == "string" and v ~= "" and byName[v] then
+                linked = true
+            elseif type(v) == "number" and byId[v]
+                and (lk:find("user") or lk:find("owner") or lk:find("player") or lk:find("team")) then
+                linked = true
             end
         end
     end)
     if linked then return true end
 
-    local par = model.Parent
-    if par and (par.Name == "Friends" or par.Name == "Survivors") then return true end
+    -- 3) any value object inside the model pointing at a player
     pcall(function()
-        local cs = game:GetService("CollectionService")
-        for _, t in ipairs(cs:GetTags(model)) do
-            if string.lower(t) == "friend" then linked = true end
-        end
-    end)
-    return linked
-end
-
-local function refreshEnemyCache()
-    local result = {}
-    local npcs = workspace:FindFirstChild("NPCs")
-    if npcs then
-        local function consider(m)
-            if m:IsA("Model") then
-                if not killWatch[m] then
-                    local h = m:FindFirstChild("Humanoid")
-                    if h then
-                        killWatch[m] = h.Died:Connect(function()
-                            local conn = killWatch[m]
-                            killWatch[m] = nil
-                            if conn then conn:Disconnect() end
-                            if lastShotTarget == m and (tick() - lastShotTime) < 3 then
-                                stats.kills += 1
-                            end
-                        end)
-                    end
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("ObjectValue") then
+                if typeof(d.Value) == "Instance" and d.Value:IsA("Player") then
+                    linked = true
                 end
-                if m:FindFirstChild("Humanoid")
-                    and m.Humanoid.Health > 0
-                    and not isPlayerOwned(m) then
-                    table.insert(result, m)
+            elseif d:IsA("StringValue") then
+                if d.Value ~= "" and byName[d.Value] then
+                    linked = true
+                end
+            elseif d:IsA("NumberValue") or d:IsA("IntValue") then
+                local dk = string.lower(d.Name)
+                if byId[d.Value]
+                    and (dk:find("user") or dk:find("owner") or dk:find("player") or dk:find("team")) then
+                    linked = true
                 end
             end
+            if linked then return end
         end
-        for _, folder in ipairs(npcs:GetChildren()) do
-            -- ONLY real enemy folders: Tango + Monsters. Allies (GOC
-            -- soldiers, teammate monsters) live in "Friends", corpses in
-            -- "Deceased" - never shoot those.
-            if folder:IsA("Folder") and (folder.Name == "Tango" or folder.Name == "Monsters") then
-                for _, m in ipairs(folder:GetChildren()) do
-                    if m:IsA("Model") then
-                        consider(m)
-                    elseif m:IsA("Folder") then
-                        -- some rounds nest squads one level deeper
-                        for _, mm in ipairs(m:GetChildren()) do
-                            consider(mm)
+    end)
+    if linked then return true end
+
+    -- 4) friendly collections
+    local par = model.Parent
+    if par and (par.Name == "Friends" or par.Name == "Survivors") then return true end
+    local okt, tags = pcall(function() return game:GetService("CollectionService"):GetTags(model) end)
+    if okt and tags then
+        for _, t in ipairs(tags) do
+            if string.lower(t) == "friend" then return true end
+        end
+    end
+    return false
+end
+
+-- ================================================================
+-- SINGLE ENEMY CACHE
+-- ================================================================
+local enemyCache = {}
+local cacheTimestamp = 0
+local CACHE_DURATION = 0.25   -- was 0.5: faster target switching
+
+local function refreshEnemyCache()
+    local now = tick()
+    if now - cacheTimestamp < CACHE_DURATION then
+        return enemyCache
+    end
+    cacheTimestamp = now
+
+    local newCache = {}
+    if npcFolder then
+        for _, v in ipairs(npcFolder:GetChildren()) do
+            if v.Name == "Tango" or v.Name == "Monsters" then
+                for _, k in ipairs(v:GetChildren()) do
+                    if k:IsA("Model") and k:FindFirstChild("HumanoidRootPart") and not isPlayerOwned(k) then
+                        local humanoid = k:FindFirstChild("Humanoid")
+                        if humanoid and humanoid.Health > 0 then
+                            table.insert(newCache, k)
                         end
                     end
                 end
             end
         end
     end
-    enemyCache = result
-    cacheTimestamp = tick()
-end
 
-local function scanCache()
-    local char = plr.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return nil end
-    local best, bestD = nil, math.huge
-    for _, m in ipairs(enemyCache) do
-        local part = m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart")
-        local hum = m:FindFirstChild("Humanoid")
-        if part and hum and hum.Health > 0 and not isPlayerOwned(m) then
-            local d = (part.Position - hrp.Position).Magnitude
-            if d < bestD then
-                best, bestD = m, d
-            end
-        end
-    end
-    return best
+    enemyCache = newCache
+    return enemyCache
 end
 
 local function getclosestenemy()
-    if tick() - cacheTimestamp > 0.5 then
-        refreshEnemyCache()
-    end
-    local best = scanCache()
-    if not best then
-        -- nothing picked: force a fresh scan (new spawns / died units)
-        refreshEnemyCache()
-        best = scanCache()
-    end
-    return best
-end
+    local enemies = refreshEnemyCache()
+    if #enemies == 0 then return nil end
 
--- ================================================================
--- GUN TOOL (gun-only: melee never picked, never fired)
--- ================================================================
-local MELEE_HINTS = { "axe", "machete", "bat", "blade", "sword", "knife", "shovel", "wrench", "crowbar", "baton" }
-
-local function isMeleeName(name)
-    local lname = string.lower(name or "")
-    for _, hint in ipairs(MELEE_HINTS) do
-        if lname:find(hint, 1, true) then return true end
-    end
-    return false
-end
-
--- preferred gun names for auto-equip (highest priority first)
-local GUN_PREF = { "mp5", "rifle", "pistol", "shotgun", "smg", "minigun", "gun" }
-
-local function getGun()
     local char = plr.Character
-    if not char then return nil, nil end
-    for _, tool in ipairs(char:GetChildren()) do
-        if tool:IsA("Tool") then
-            local main = tool:FindFirstChild("Main")
-            if not (main and main:IsA("RemoteEvent")) then
-                -- some weapons only re-materialize the remote while equipped
-                for _, d in ipairs(tool:GetChildren()) do
-                    if d:IsA("RemoteEvent") or d:IsA("UnreliableRemoteEvent") then
-                        main = d
-                        break
-                    end
-                end
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local playerPos = hrp and hrp.Position or nil
+
+    ensureGenerator()
+
+    local closest = nil
+    local bestKey = math.huge
+
+    for _, k in ipairs(enemies) do
+        local targetHrp = k:FindFirstChild("HumanoidRootPart")
+        if targetHrp then
+            local key
+            if generatorPos then
+                -- PERMANENT RULE: rank by distance to the generator
+                key = (targetHrp.Position - generatorPos).Magnitude
+            elseif playerPos then
+                -- no generator on this map: closest to player
+                key = (targetHrp.Position - playerPos).Magnitude
             end
-            if main and main:IsA("RemoteEvent") and not isMeleeName(tool.Name) then
-                return tool, main
+            if key and key < bestKey then
+                closest = k
+                bestKey = key
             end
         end
     end
-    return nil, nil
+    return closest
 end
 
--- auto-equip a gun from the Backpack (weapons sit there unequipped)
-local lastEquipTry = 0
-local function autoEquipGun()
-    if tick() - lastEquipTry < 1 then return false end
-    lastEquipTry = tick()
+-- ================================================================
+-- CACHED TOOL / REMOTE
+-- ================================================================
+local cachedTool = nil
+local cachedRemote = nil
+
+local function getTool()
     local char = plr.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local bp = plr:FindFirstChildOfClass("Backpack")
-    if not (hum and bp) then return false end
-    local best, bestScore
-    for _, t in ipairs(bp:GetChildren()) do
-        if t:IsA("Tool") and not isMeleeName(t.Name) then
-            local score = 1
-            local lname = string.lower(t.Name)
-            for _, p in ipairs(GUN_PREF) do
-                if lname:find(p, 1, true) then
-                    score = 2
-                    break
-                end
-            end
-            if not best or score > bestScore then
-                best, bestScore = t, score
-            end
-        end
+    if not char then return nil end
+    if cachedTool and cachedTool.Parent == char then
+        return cachedTool
     end
-    if best then
-        pcall(function() hum:EquipTool(best) end)
-        print("[farm v2] auto-equipped gun: " .. best.Name)
-        return true
+    cachedTool = char:FindFirstChildOfClass("Tool")
+    if cachedTool then
+        cachedRemote = cachedTool:FindFirstChild("Main")
+    else
+        cachedRemote = nil
     end
-    return false
+    return cachedTool
 end
 
 local function getAmmo()
-    local gui = plr:FindFirstChild("PlayerGui")
+    local gui = plr.PlayerGui
     if not gui then return 999 end
     local crosshair = gui:FindFirstChild("Crosshair")
     if not crosshair then return 999 end
@@ -495,760 +508,30 @@ local function getAmmo()
     return tonumber(stored.Text) or 999
 end
 
-print("[farm v2] step2 - core built")
-
 -- ================================================================
--- AMMO-BOX CAMP
+-- COMBAT TOGGLES (throttled, stop in <100ms on toggle off, idle when dead)
 -- ================================================================
-local camp = { map = nil, box = nil, pos = nil, besidePos = nil, underBad = false, nextScan = 0 }
-local lastClaim = 0
-local noGunWarnedAt = 0
 
-local function boxPosition(box)
-    if not box then return nil end
-    if box:IsA("BasePart") then return box.Position end
-    if box:IsA("Model") then
-        if box.PrimaryPart then return box.PrimaryPart.Position end
-        local p = box:FindFirstChildWhichIsA("BasePart")
-        if p then return p.Position end
-        local ok, pos = pcall(function() return box:GetPivot().Position end)
-        if ok and pos then return pos end
+-- interruptible sleep: wakes every `slice` so toggling OFF takes effect fast,
+-- but still respects the throttle rate (no busy-waiting)
+local function sleepWhile(cond, seconds, slice)
+    local deadline = tick() + seconds
+    while cond() and tick() < deadline do
+        task.wait(slice or 0.02)
     end
-    return nil
 end
 
--- active map = the map whose AmmoBoxes folder currently has boxes
-local function activeAmmoFolder()
-    local maps = workspace:FindFirstChild("Maps")
-    if not maps then return nil, nil end
-    local bestMap, bestFolder, bestCount = nil, nil, 0
-    for _, map in ipairs(maps:GetChildren()) do
-        local inter = map:FindFirstChild("Interactable")
-        local ab = inter and inter:FindFirstChild("AmmoBoxes")
-        if ab then
-            local n = 0
-            for _, c in ipairs(ab:GetChildren()) do
-                if c:IsA("BasePart") or c:IsA("Model") then
-                    n += 1
-                end
-            end
-            if n > bestCount then
-                bestMap, bestFolder, bestCount = map, ab, n
-            end
-        end
-    end
-    if bestCount == 0 then return nil, nil end
-    return bestMap, bestFolder
-end
-
--- lowest point of the box + ground search = a real "UNDER the box" spot
-local underBox = {}
-local function boxUnderPosition(box)
-    if underBox[box] then return underBox[box] end
-    local x, z, baseY
-    pcall(function()
-        local cf, size = box:GetBoundingBox()
-        baseY = cf.Position.Y - size.Y / 2
-        x = cf.Position.X
-        z = cf.Position.Z
-    end)
-    if not baseY then
-        local pos = boxPosition(box)
-        if not pos then return nil end
-        x, z, baseY = pos.X, pos.Z, pos.Y
-    end
-    local from = Vector3.new(x, baseY - 0.3, z)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
+local function charAlive()
     local char = plr.Character
-    params.FilterDescendantsInstances = char and { char, box } or { box }
-    local hit = workspace:Raycast(from, Vector3.new(0, -25, 0), params)
-    local spot
-    if hit then
-        spot = Vector3.new(x, hit.Position.Y + 3.2, z)
-    else
-        spot = Vector3.new(x, baseY - 3.2, z)
-    end
-    underBox[box] = spot
-    return spot
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
 end
 
-local function pickBox(folder)
-    local char = plr.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local best, bestD
-    for _, c in ipairs(folder:GetChildren()) do
-        local pos = boxPosition(c)
-        if pos then
-            local d = hrp and (pos - hrp.Position).Magnitude or math.huge
-            if not best or d < bestD then
-                best, bestD = c, d
-            end
-        end
-    end
-    if not best then
-        best = folder:GetChildren()[1]
-    end
-    return best
-end
+-- shots fired counter (for tuning/verification)
+local shotCount = { silent = 0, kill = 0 }
 
-local function campTick()
-    -- menu open = not deployed: never camp, deploy first
-    if menuOpen() then
-        camp.nextScan = 0 -- fresh box scan right after deploying
-        return
-    end
-    if plr.Team ~= teamPlayers then return end
-    if not alive() then return end
-
-    -- persistent camp: re-pivot whenever we drift away (respawn, push...)
-    -- falling through a false floor -> permanently switch this box to the
-    -- beside-the-box spot
-    if camp.pos and camp.box and camp.box.Parent then
-        local charC = plr.Character
-        local hrp = charC and charC:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            if hrp.AssemblyLinearVelocity.Y < -25 then
-                camp.underBad = true
-                if camp.besidePos then
-                    camp.pos = camp.besidePos
-                    underBox[camp.box] = "BESIDE"
-                end
-            end
-            if camp.pos and (hrp.Position - camp.pos).Magnitude > 6 then
-                pcall(function()
-                    plr.Character:PivotTo(CFrame.new(camp.pos))
-                end)
-            end
-        end
-    end
-
-    if tick() >= camp.nextScan or (camp.box and not camp.box.Parent) then
-        camp.nextScan = tick() + 10
-        local map, folder = activeAmmoFolder()
-        if folder then
-            if not camp.box or not camp.box.Parent or camp.map ~= map then
-                camp.map = map
-                camp.box = pickBox(folder)
-                local underOrBase = camp.box and boxUnderPosition(camp.box)
-                if underOrBase then
-                    if underOrBase == "BESIDE" then
-                        -- previous falling test proved this box's under-spot
-                        -- has no floor - stay beside/on the platform (cached)
-                        camp.underBad = true
-                        if not camp.besidePos then
-                            local base = boxPosition(camp.box)
-                            camp.besidePos = base and (base + Vector3.new(0, 2.5, 0)) or nil
-                        end
-                        camp.pos = camp.besidePos
-                    else
-                        camp.underBad = false
-                        camp.pos = underOrBase
-                        local base = boxPosition(camp.box)
-                        camp.besidePos = base and (base + Vector3.new(0, 2.5, 0)) or underOrBase
-                    end
-                    pcall(function()
-                        plr.Character:PivotTo(CFrame.new(camp.pos))
-                    end)
-                    print("[farm v2] camping ammo box @ " .. map.Name .. " y=" .. string.format("%.1f", camp.pos.Y))
-                end
-            end
-        else
-            camp.map = nil
-            camp.box = nil
-        end
-    end
-
-    -- claim only when reserve runs low: the refill prompt needs close
-    -- range, so when dry we step beside the box, claim, step back under
-    if camp.box and tick() - lastClaim >= 4 then
-        lastClaim = tick()
-        local reserve = getAmmo()
-        local dry = reserve <= cfg.resupplyAt
-        if dry then
-            local charC = plr.Character
-            if camp.besidePos and (charC.HumanoidRootPart.Position - camp.besidePos).Magnitude > 3 then
-                pcall(function() charC:PivotTo(CFrame.new(camp.besidePos)) end)
-                task.wait(0.35)
-            end
-            local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-            local bestP, bestD
-            for _, d in ipairs(camp.box:GetDescendants()) do
-                if d:IsA("ProximityPrompt") and d.Enabled and d.Parent then
-                    local part = d.Parent:IsA("BasePart") and d.Parent or d.Parent.PrimaryPart
-                    local dist = (hrp and part) and (part.Position - hrp.Position).Magnitude or 0
-                    if not bestD or dist < bestD then
-                        bestP, bestD = d, dist
-                    end
-                end
-            end
-            if bestP then
-                local ok = false
-                pcall(function()
-                    if bestP.HoldDuration > 0.5 then
-                        bestP.HoldDuration = 0.4
-                    end
-                    if fireproximityprompt then
-                        fireproximityprompt(bestP) -- same as pressing E
-                        ok = true
-                    else
-                        bestP:InputHoldBegin()
-                        task.wait(0.55)
-                        bestP:InputHoldEnd()
-                        ok = true
-                    end
-                end)
-                if ok then
-                    stats.claims += 1
-                    local after = getAmmo()
-                    if after > reserve then
-                        print("[farm v2] resupplied: " .. reserve .. " -> " .. after .. " rounds")
-                    end
-                end
-            end
-            if camp.besidePos and camp.pos and camp.pos ~= camp.besidePos then
-                task.wait(0.25)
-                pcall(function() plr.Character:PivotTo(CFrame.new(camp.pos)) end)
-            end
-        end
-    end
-end
-
-print("[farm v2] step3 - camp built")
-
--- ================================================================
--- DEPLOY / RESPAWN / VOTES / DOWNED
--- ================================================================
-local lastDeployTry = 0
-
--- downed = SecondChance panel ("PRESS G OR CLICK TO GET UP") visible;
--- downMechanic.Enabled is always true, so it is NOT a downed signal
-local function downedVisible()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    local cp = pg:FindFirstChild("CardPick")
-    local sc = cp and cp:FindFirstChild("Root") and cp.Root:FindFirstChild("SecondChance")
-    return (sc and sc.Visible) and true or false
-end
-
--- deploy — remote-first, straight out of the decompiled SafehouseBar:
--- the game refuses EVERY deploy (button clicks included) while
---   * a vote is running          (GameStatus.BlockExit.Value == true)
---   * the map vote is unresolved (ReplicatedStorage.Map ObjectValue = nil)
--- and the deploy itself is just Remotes.DeployRequest:FireServer().
-local deployWaitNote = 0
-local voteWaitNote = 0
-local function tryDeploy()
-    if tick() - lastDeployTry < 3 then return false end
-    lastDeployTry = tick()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    -- DEATH WISH penalty: dying forces a countdown ("YOU CAN DEPLOY IN Xs")
-    -- while the deploy button is LOCKED. Pressing during Wait is pointless,
-    -- so hold off until the countdown frame hides.
-    local ds = pg:FindFirstChild("DeathScreen")
-    if ds and ds.Root then
-        local wt = ds.Root:FindFirstChild("Wait")
-        if wt and wt.Visible then
-            if tick() - deployWaitNote >= 10 then
-                deployWaitNote = tick()
-                print("[farm v2] death screen deploy timer running - waiting it out")
-            end
-            return false
-        end
-    end
-    -- the game's own deploy blocking states (decompiled SafehouseBar)
-    local RS = game:GetService("ReplicatedStorage")
-    local mapObj = RS:FindFirstChild("Map")
-    local mapOk = false
-    if mapObj and mapObj:IsA("ObjectValue") then
-        local mv = mapObj.Value
-        if mv and mv.Parent then mapOk = true end
-    end
-    if not mapOk then
-        if tick() - voteWaitNote >= 10 then
-            voteWaitNote = tick()
-            print("[farm v2] deploy blocked: map vote not finished - clicking votes first")
-        end
-        return false -- modernVoteTick keeps pressing the vote cards meanwhile
-    end
-    local gs = RS:FindFirstChild("GameStatus")
-    local bx = gs and gs:FindFirstChild("BlockExit")
-    if bx and bx.Value == true then
-        if tick() - voteWaitNote >= 10 then
-            voteWaitNote = tick()
-            print("[farm v2] deploy blocked: a vote is running")
-        end
-        return false
-    end
-    -- deploy via the remote (no clicks needed, works from the death screen too)
-    local rem = RS:FindFirstChild("Remotes")
-    local dr = rem and rem:FindFirstChild("DeployRequest")
-    if dr and workspace:GetAttribute("DeployRequestOff") ~= true
-        and notDeployedNow() then
-        stats.deploys += 1
-        lastDeployTry = tick() + 9
-        dr:FireServer()
-        print("[farm v2] DeployRequest fired (deploy #" .. stats.deploys .. ")")
-        return true
-    end
-    -- fallback: the HUD bar button (works fine once nothing is blocked)
-    local btn = getCachedDeploy(pg)
-    if btn and notDeployedNow() then
-        if pressButton(btn) then
-            stats.deploys += 1
-            -- one press per ~12s: TRL queues one spawn per click
-            lastDeployTry = tick() + 9
-            print("[farm v2] pressed deploy (deploy #" .. stats.deploys .. ")")
-            return true
-        end
-    end
-    -- downed: only touch panels when SecondChance is actually visible
-    if downedVisible() then
-        local dm = pg:FindFirstChild("downMechanic")
-        if dm then
-            local rsp = dm:FindFirstChild("Respawn")
-            local rspBtn = rsp and rsp:FindFirstChild("Button")
-            if rspBtn and rspBtn.Visible then
-                if pressButton(rspBtn) then
-                    print("[farm v2] pressed downed Respawn")
-                    return true
-                end
-            end
-        end
-    end
-    for _, name in ipairs({ "RespawnChoice", "RapidDeployUI", "TacticalSpawnWindow", "DeathScreen", "Death" }) do
-        local gui = pg:FindFirstChild(name)
-        if gui and gui.Enabled and pressByText(gui, { "play", "deploy", "respawn", "redeploy", "continue", "resume" }) then
-            stats.deploys += 1
-            print("[farm v2] pressed respawn/lobby deploy in " .. name .. " (deploy #" .. stats.deploys .. ")")
-            return true
-        end
-    end
-    return false
-end
-
--- revive: CLICK the SecondChance button (no key presses at all: the G key
--- is also the ability key and the farm must never use abilities)
-local function respawnClick()
-    if not downedVisible() then return false end
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    local cp = pg:FindFirstChild("CardPick")
-    local sc = cp and cp:FindFirstChild("Root") and cp.Root:FindFirstChild("SecondChance")
-    if sc and sc.Visible then
-        if pressButton(sc) then
-            print("[farm v2] clicked SecondChance (got up)")
-            return true
-        end
-    end
-    for _, name in ipairs({ "RespawnChoice", "DeathScreen", "Death", "downMechanic" }) do
-        local gui = pg:FindFirstChild(name)
-        if gui and gui.Enabled then
-            local hit = pressByText(gui, { "respawn", "redeploy", "deploy", "continue", "resume" })
-            if hit then
-                print("[farm v2] respawn clicked in " .. name)
-                return true
-            end
-        end
-    end
-    return false
-end
-
--- vote auto-click while a vote gui is visible. matching: short tokens
--- ("on"/"off"/"354") match as whole words so they never hit "zone",
--- "connection" etc.; longer tokens (easy/medium/brutal/forest/desert)
--- match as plain substring (case-insensitive, txt is lowercased)
-local function voteMatches(txt, target)
-    if #target <= 3 then
-        local hit = txt:match("%f[%w]" .. target .. "%f[%W]")
-        return hit ~= nil
-    end
-    return txt:find(target, 1, true) ~= nil
-end
-
-local pressGate = {}
-
--- LIVE vote casting through the remotes the game itself uses (decompiled
--- GameMain.Voting.VoteCreator): every vote answer is
---     AssignVote:InvokeServer(voteName, optionName)
--- Votes arrive as Template clones in GameMain.Voting (clone Name = vote
--- name, its Votes container holds one option frame per choice). Remote
--- casting sidesteps the ally band entirely - its pills are textless icon
--- buttons no text matcher can ever read.
-local function remoteVoteTick(pg, normalTargets, allyTargets)
-    local RS = game:GetService("ReplicatedStorage")
-    local rem = RS:FindFirstChild("Remotes")
-    local cv = rem and rem:FindFirstChild("CreateVote")
-    local av = cv and cv:FindFirstChild("AssignVote")
-    if not av then return false end
-    local gm = pg:FindFirstChild("GameMain")
-    local voting = gm and gm:FindFirstChild("Voting")
-    if not voting then return false end
-
-    local acted = false
-    for _, clone in ipairs(voting:GetChildren()) do
-        if acted then break end
-        if clone:IsA("GuiObject") and clone.Name ~= "Template" then
-            local voteName = clone.Name
-            local lname = string.lower(voteName)
-            local isAlly = lname:find("ally", 1, true) ~= nil
-            local targets = isAlly and allyTargets or normalTargets
-            if isAlly and #allyTargets == 0 then
-                -- ally votes left manual ("Leave to me")
-            elseif not isAlly and #normalTargets == 0 then
-                -- Auto / Any / Any votes untouched
-            else
-                local votesRow = clone:FindFirstChild("Votes") or clone
-                for _, opt in ipairs(votesRow:GetChildren()) do
-                    if acted then break end
-                    if opt:IsA("Frame") and opt:FindFirstChild("VoteFrame") then
-                        local composed = " " .. string.lower(opt.Name) .. " "
-                        for _, c in ipairs(opt:GetDescendants()) do
-                            if c:IsA("TextLabel") then
-                                local t = string.lower(tostring(c.Text))
-                                if t ~= "vote" and t ~= "0" then
-                                    composed = composed .. t .. " "
-                                end
-                            end
-                        end
-                        -- level-locked options are not selectable
-                        if not string.find(composed, "level %d", 1, false) then
-                            local matched = nil
-                            for _, t in ipairs(targets) do
-                                if voteMatches(composed, t) then
-                                    matched = t
-                                    break
-                                end
-                            end
-                            if matched then
-                                local now2 = tick()
-                                local g = pressGate["REM " .. voteName]
-                                if not g or now2 - g >= 2 then
-                                    pressGate["REM " .. voteName] = now2
-                                    local okSend = pcall(function()
-                                        av:InvokeServer(voteName, opt.Name)
-                                    end)
-                                    acted = true
-                                    print("[farm v2] remote vote '" .. voteName
-                                        .. "' -> '" .. tostring(matched)
-                                        .. "' (" .. opt.Name .. ") ok=" .. tostring(okSend))
-                                else
-                                    acted = true
-                                end
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return acted
-end
-
--- modern voting (GameMain.ModernVoting): each option is an Option-frame
--- holding a textless VoteFrame/Button; the option's NAME and its own
--- TextLabels carry the words (AREA 354 (CLASSIC) / FOREST / DESERT /
--- BRUTAL / DEATH WISH / CLASSIC BRUTAL...). One press per 2s, and the
--- "CLASSIC BRUTAL" deathwish-standard card is never mistaken for the
--- difficulty "BRUTAL".
-local function modernVoteTick(pg)
-    local gm = pg:FindFirstChild("GameMain")
-    if not gm then return false end
-    local mv = gm:FindFirstChild("ModernVoting")
-    if not (mv and mv.Visible) then return false end
-    -- vote cards idle on screen even mid-match: only click while we are
-    -- actually in the lobby/menu (the deploy bar or MenuStage is up), so
-    -- combat never receives stray vote presses
-    if not menuOpen() then return false end
-
-    local pressed = false
-    for _, opt in ipairs(mv:GetDescendants()) do
-        if pressed then break end
-        if opt:IsA("Frame") then
-            local vf = opt:FindFirstChild("VoteFrame")
-            local btn = opt:FindFirstChild("Button") or (vf and vf:FindFirstChild("Button"))
-            if btn and btn:IsA("GuiButton") and chainVisible(btn) then
-                local composed = " " .. string.lower(opt.Name) .. " "
-                for _, c in ipairs(opt:GetDescendants()) do
-                    if c:IsA("TextLabel") then
-                        local t = string.lower(tostring(c.Text))
-                        if t ~= "vote" and t ~= "0" then
-                            composed = composed .. t .. " "
-                        end
-                    end
-                end
-                local isDwOpt = composed:find("deathwish", 1, true) ~= nil
-                    or composed:find("death wish", 1, true) ~= nil
-
-                -- 1) DEATH WISH vote (On / Off), only when configured
-                if cfg.deathwish == "On" and isDwOpt
-                    and not composed:find("classic brutal", 1, true) then
-                    local now = tick()
-                    local g = pressGate["ModernDeathwish"]
-                    if not g or now - g >= 2 then
-                        pressGate["ModernDeathwish"] = now
-                        pressButton(btn)
-                        pressed = true
-                        print("[farm v2] voted DEATH WISH on")
-                    else
-                        pressed = true
-                    end
-                elseif cfg.deathwish == "Off" and not isDwOpt
-                    and composed:find("standard", 1, true) then
-                    local now = tick()
-                    local g = pressGate["ModernDeathwish"]
-                    if not g or now - g >= 2 then
-                        pressGate["ModernDeathwish"] = now
-                        pressButton(btn)
-                        pressed = true
-                        print("[farm v2] voted death wish off (classic brutal)")
-                    else
-                        pressed = true
-                    end
-
-                -- 2) difficulty / map / versus: never touch the death-wish pair
-                elseif not isDwOpt and not composed:find("classic brutal", 1, true) then
-                    for _, t in ipairs(normalTargets) do
-                        if voteMatches(composed, t) then
-                            local now = tick()
-                            local g = pressGate["ModernVote"]
-                            if not g or now - g >= 2 then
-                                pressGate["ModernVote"] = now
-                                pressButton(btn)
-                                pressed = true
-                                print("[farm v2] vote click '" .. tostring(t)
-                                    .. "' (ModernVoting." .. opt.Name .. ")")
-                            else
-                                pressed = true
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return pressed
-end
-
-local function voteTick()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return end
-    -- ally votes get their OWN target list, so difficulty/map/versus tokens
-    -- can never misclick inside the ally frames (and vice versa)
-    local normalTargets, allyTargets = {}, {}
-    if cfg.difficulty ~= "Auto" then table.insert(normalTargets, string.lower(cfg.difficulty)) end
-    if cfg.map ~= "Any" then table.insert(normalTargets, string.lower(cfg.map)) end
-    if cfg.versus == "On" then table.insert(normalTargets, "on") end
-    if cfg.versus == "Off" then table.insert(normalTargets, "off") end
-    if cfg.ally ~= "Any" then
-        -- ally buttons are labelled after the allied group (GOC / MCD a.k.a.
-        -- Marshall Carter & Dark / UIU) or the pass option ("None"/"No ally")
-        local ALLY_TOKENS = {
-            GOC = { "goc" },
-            MCD = { "mcd", "mc&d", "marshall", "carter", "daugh" },
-            UIU = { "uiu" },
-            ["None"] = { "none", "no ally", "noallies", "solo" },
-        }
-        local toks = ALLY_TOKENS[cfg.ally]
-        if toks then
-            for _, t in ipairs(toks) do table.insert(allyTargets, t) end
-        end
-    end
-    -- primary: cast live votes through the game's own AssignVote remote
-    -- (works for the textless ally pills); on any cast/gate this tick the
-    -- UI clickers below are skipped so we never double-vote
-    if remoteVoteTick(pg, normalTargets, allyTargets) then return end
-
-    -- modern voting click fallback (GameMain.ModernVoting). When it
-    -- consumed this tick (pressed or 2s-gated) the legacy vote frames are
-    -- skipped so we never double-press the same election.
-    local modernBusy = modernVoteTick(pg)
-
-    -- legacy/name vote guis: every enabled ScreenGui whose name contains
-    -- "vote" (VoteStepper / VoteReveal / AllyVote / Ext*Vote) +
-    -- MenuOperatives (ally faction roster buttons: GOC / MCD / UIU).
-    local frames = {}
-    for _, gui in ipairs(pg:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled
-            and string.find(string.lower(gui.Name), "vote", 1, true) then
-            table.insert(frames, gui)
-        end
-    end
-    local mOper = pg:FindFirstChild("MenuOperatives")
-    if mOper and mOper.Enabled then table.insert(frames, mOper) end
-
-    if modernBusy then return end
-    for _, gui in ipairs(frames) do
-        local name = gui.Name
-        local lname = string.lower(name)
-        local isAlly = lname:find("ally", 1, true) ~= nil or name == "MenuOperatives"
-        if isAlly and #allyTargets == 0 then
-            -- ally mode "Leave to me": ally frames stay manual
-        elseif not isAlly and #normalTargets == 0 then
-            -- Auto / Any / Any: nothing to click in the normal votes
-        else
-            local targets = isAlly and allyTargets or normalTargets
-            local pressedFrame = false
-            for _, d in ipairs(gui:GetDescendants()) do
-                if isAlly and pressedFrame then break end
-                if (d:IsA("TextButton") or d:IsA("GuiButton")) and chainVisible(d) then
-                    local txt = ""
-                    pcall(function() txt = string.lower(tostring(d.Text)) end)
-                    for _, t in ipairs(targets) do
-                        if voteMatches(txt, t) then
-                            -- ally frames: max 1 press per 2s (never spam
-                            -- a post-vote "Allied!" state text)
-                            local now = tick()
-                            if not isAlly
-                                or (not pressGate[name] or now - pressGate[name] >= 2) then
-                                pressButton(d)
-                                pressGate[name] = now
-                                if isAlly then pressedFrame = true end
-                                print("[farm v2] vote click '" .. tostring(d.Text) .. "' (" .. name .. ")")
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-            -- telemetry: ally vote open but no faction button matched
-            -- (e.g. the CHOOSE AN ALLY band's pills are textless icons) -
-            -- log it once so the missing token/structure can be fixed
-            if isAlly and not pressedFrame then
-                local now = tick()
-                local gate = pressGate[name .. "-miss"]
-                if not gate or now - gate >= 6 then
-                    pressGate[name .. "-miss"] = now
-                    print("[farm v2] " .. name .. " open - no faction button matched ("
-                        .. table.concat(allyTargets, "/") .. ")")
-                end
-            end
-        end
-    end
-end
-
-print("[farm v2] step4 - deploy/vote built")
-
--- ================================================================
--- STREAK RESET (kills streak, auto-press the in-game reset button)
--- ================================================================
-local RESET_STREAK = 350
-local lastResetScan = 0
-
--- streak = our local kill counter (monsters that died within 3s of our
--- last shot); LB_Kills only syncs at match end so it is not usable live
-local function getStreak()
-    return stats.kills
-end
-
-local function markReset()
-    stats.kills = 0
-    stats.resets += 1
-    print("[farm v2] streak reset done (resets #" .. stats.resets .. ")")
-end
-
-local function streakTick()
-    local streak = getStreak()
-    if streak < RESET_STREAK then return end
-    if tick() - lastResetScan < 3 then return end
-    lastResetScan = tick()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return end
-    for _, name in ipairs({ "Stats", "HUD", "LakeTeamHUD", "LakeXpPop", "KillStreaks" }) do
-        local gui = pg:FindFirstChild(name)
-        if gui then
-            local hit = pressByText(gui, { "reset" })
-            if hit then
-                markReset()
-                return
-            end
-        end
-    end
-    if streak >= RESET_STREAK + 40 then
-        print("[farm v2] streak " .. streak .. " - no reset button found yet")
-    end
-end
-
--- ================================================================
--- CARD AUTO-PICK (CardPick / ResearchPick - priority: infinite ammo)
--- ================================================================
-local CARD_PRIORITY = {
-    "infinite", "unlimited",
-    "ammo", "mag", "magazine",
-    "gun", "weapon", "fire rate", "damage", "reload",
-}
-local lastPickTry = 0
-
-local function cardText(b)
-    local combined = ""
-    pcall(function()
-        combined = string.lower(tostring(b.Text or ""))
-        for _, d in ipairs(b:GetDescendants()) do
-            if d:IsA("TextLabel") or d:IsA("TextButton") then
-                combined = combined .. " " .. string.lower(tostring(d.Text))
-            end
-        end
-    end)
-    return combined
-end
-
-local function pickTick()
-    if tick() - lastPickTry < 1 then return end
-    lastPickTry = tick()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return end
-    for _, name in ipairs({ "CardPick", "ResearchPick" }) do
-        local gui = pg:FindFirstChild(name)
-        if gui and gui.Enabled then
-            local cards = {}
-            for _, d in ipairs(gui:GetDescendants()) do
-                if d:IsA("GuiButton") and d.Visible
-                    and d.Name ~= "Dim" and d.Name ~= "MouseFree" and d.Name ~= "Hide"
-                    and d.AbsoluteSize.X < 800 and d.AbsoluteSize.Y < 800 then
-                    table.insert(cards, d)
-                end
-            end
-            local real = {}
-            for _, b in ipairs(cards) do
-                local named = string.match(b.Name, "^Card%d+$") ~= nil
-                    or string.match(b.Name, "^Option%d+$") ~= nil
-                if named or cardText(b):gsub("%s+", "") ~= "" then
-                    table.insert(real, b)
-                end
-            end
-            if #real > 0 then
-                local pick, pickScore
-                for _, b in ipairs(real) do
-                    local txt = cardText(b)
-                    for i, kw in ipairs(CARD_PRIORITY) do
-                        if txt:find(kw, 1, true) then
-                            local score = #CARD_PRIORITY - i + 1
-                            if not pickScore or score > pickScore then
-                                pick, pickScore = b, score
-                            end
-                            break
-                        end
-                    end
-                end
-                if not pick then pick = real[1] end
-                local shown = ""
-                pcall(function() shown = tostring(pick.Text) end)
-                pressButton(pick)
-                stats.picks += 1
-                print("[farm v2] picked card in " .. name .. " ('" .. shown .. "')")
-            end
-        end
-    end
-end
-
-print("[farm v2] step4b - card picker built")
-
--- ================================================================
--- ATTACK - hub kill aura, exact port (gun packets only, melee never)
--- ================================================================
+-- target must still be alive, else force a cache rescan immediately
 local function validTarget(target)
     if not target or not target.Parent then return false end
     local hum = target:FindFirstChild("Humanoid")
@@ -1256,398 +539,671 @@ local function validTarget(target)
         cacheTimestamp = 0
         return false
     end
-    return (target:FindFirstChild("Head") ~= nil)
-        or (target:FindFirstChild("HumanoidRootPart") ~= nil)
+    return target:FindFirstChild("Head") ~= nil
 end
 
-local function attackTick()
-    if not alive() then return end
-    if menuOpen() then return end -- menu open = not deployed: never fire
-    local tool, remote = getGun()
-    if not remote then
-        if cfg.autoWeapons and autoEquipGun() then
-            return -- next tick fires with the equipped gun
+-- Silent Aim
+local silentAimOn = false
+local silentAimLoop = false
+local SILENT_AIM_RATE = 0.02   -- ~50 shots/sec (maxed out)
+local IDLE_WAIT = 0.4          -- dead / no weapon = near-zero activity
+
+local function setSilentAim(state)
+    silentAimOn = state
+    if not state or silentAimLoop then return end
+    silentAimLoop = true
+
+    task.spawn(function()
+        while silentAimOn do
+            if not charAlive() then
+                sleepWhile(function() return silentAimOn end, IDLE_WAIT, 0.05)
+                continue
+            end
+
+            local tool = getTool()
+            local remote = cachedRemote
+            if not tool or not remote then
+                sleepWhile(function() return silentAimOn end, IDLE_WAIT, 0.05)
+                continue
+            end
+
+            local target = getclosestenemy()
+            if not validTarget(target) then
+                sleepWhile(function() return silentAimOn end, 0.05)
+                continue
+            end
+
+            local head = target:FindFirstChild("Head")
+            shotCount.silent += 1
+            pcall(function()
+                remote:FireServer("DAMAGE", {head, head.Position, 0, false})
+            end)
+            sleepWhile(function() return silentAimOn end, SILENT_AIM_RATE)
         end
-        if tick() - noGunWarnedAt > 20 then
-            noGunWarnedAt = tick()
-            print("[farm v2] no gun available yet - waiting for loadout")
+        silentAimLoop = false
+    end)
+end
+
+-- Kill Closest
+local killClosestOn = false
+local killClosestLoop = false
+local KILL_RATE = 0.015         -- ~66 swings/sec (maxed out)
+
+local function setKillClosest(state)
+    killClosestOn = state
+    if not state or killClosestLoop then return end
+    killClosestLoop = true
+
+    task.spawn(function()
+        while killClosestOn do
+            if not charAlive() then
+                sleepWhile(function() return killClosestOn end, IDLE_WAIT, 0.05)
+                continue
+            end
+
+            local tool = getTool()
+            local remote = cachedRemote
+            if not tool or not remote then
+                sleepWhile(function() return killClosestOn end, IDLE_WAIT, 0.05)
+                continue
+            end
+
+            local target = getclosestenemy()
+            if not validTarget(target) then
+                sleepWhile(function() return killClosestOn end, 0.05)
+                continue
+            end
+
+            local head = target:FindFirstChild("Head")
+            local ammo = getAmmo()
+
+            -- DAMAGE always fires (this is what kills); ammo only gates the
+            -- cosmetic shot-feel calls, so low reserve never stalls the aura
+            shotCount.kill += 1
+            pcall(function()
+                remote:FireServer("DAMAGE", {head, head.Position, 0, false})
+                if ammo and ammo >= 10 then
+                    remote:FireServer("AMMO")
+                    local handle = tool:FindFirstChild("Handle")
+                    if handle then
+                        local barrel = handle:FindFirstChild("Barrel")
+                        if barrel then
+                            remote:FireServer("MUZZLE", barrel)
+                        end
+                    end
+                end
+            end)
+
+            sleepWhile(function() return killClosestOn end, KILL_RATE)
+        end
+        killClosestLoop = false
+    end)
+end
+
+-- ONE button drives both (user request: same button)
+local function setCombat(state)
+    setSilentAim(state)
+    setKillClosest(state)
+end
+
+combatTab:label{ Text = "🎯 Silent Aim", Description = "Auto-aim + kill aura" }
+combatTab:toggle{
+    Name = "⚔️ Combat Combo",
+    Description = "Silent aim + kill closest in one toggle",
+    StartingState = false,
+    Callback = setCombat,
+}
+
+-- ================================================================
+-- ESP (single update loop, safe cleanup)
+-- ================================================================
+local espEnabled = false
+local espLoopRunning = false
+local espHighlights = {}
+
+local function updateESP()
+    if not espEnabled then
+        for i = #espHighlights, 1, -1 do
+            local h = espHighlights[i]
+            pcall(function() h:Destroy() end)
+            table.remove(espHighlights, i)
         end
         return
     end
-    local target = getclosestenemy()
-    if not validTarget(target) then return end
 
-    local head = target:FindFirstChild("Head") or target:FindFirstChild("HumanoidRootPart")
-    local ammo = getAmmo()
+    local enemies = refreshEnemyCache()
 
-    stats.shots += 1
-    lastShotTarget = target
-    lastShotTime = tick()
-    pcall(function()
-        -- identical to the hub kill aura: DAMAGE always fires (this kills);
-        -- AMMO/MUZZLE are cosmetic shot-feel, gated on reserve
-        remote:FireServer("DAMAGE", { head, head.Position, 0, false })
-        if ammo and ammo >= 10 then
-            remote:FireServer("AMMO")
-            local handle = tool:FindFirstChild("Handle")
-            local barrel = handle and handle:FindFirstChild("Barrel")
-            if barrel then
-                remote:FireServer("MUZZLE", barrel)
-            end
-        end
-    end)
-end
-
--- ================================================================
--- MAIN LOOPS
--- ================================================================
-local wasAlive = true
-local deathDumped = 0
-
-local function dumpDeathOptions()
-    if tick() - deathDumped < 30 then return end
-    deathDumped = tick()
-    local pg = plr:FindFirstChild("PlayerGui")
-    if not pg then return end
-    for _, name in ipairs({ "DeathScreen", "Death", "downMechanic", "RespawnChoice" }) do
-        local gui = pg:FindFirstChild(name)
-        if gui and gui.Enabled then
-            for _, d in ipairs(gui:GetDescendants()) do
-                if d:IsA("TextButton") and d.Visible and d.Text ~= "" then
-                    print("[farm v2] death-btn> " .. d:GetFullName() .. " => '" .. tostring(d.Text) .. "'")
-                end
-            end
-        end
-    end
-end
-
-local loopsAlive = {}
-local function looper(name, fn, rate)
-    loopsAlive[name] = true
-    task.spawn(function()
-        while loopsAlive[name] and genv.BIOSYN_FARM_RUN_ID == RUN_ID do
-            if farmOn then
-                local ok, err = pcall(fn)
-                if not ok then
-                    print("[farm v2] " .. name .. " error: " .. tostring(err))
-                end
-            end
-            task.wait(rate)
-        end
-        loopsAlive[name] = nil
-    end)
-end
-
-looper("attack", attackTick, cfg.attackRate)
-looper("camp", campTick, 1)
-looper("state", function()
-    voteTick()
-    if cfg.autoCards then
-        pickTick()
-    end
-    streakTick()
-    local nowAlive = alive()
-    if nowAlive and not wasAlive then
-        stats.deaths += 1
-        print("[farm v2] died -> waiting respawn (deaths #" .. stats.deaths .. ")")
-        dumpDeathOptions()
-    end
-    wasAlive = nowAlive
-    if not nowAlive then
-        respawnClick()
-    end
-    tryDeploy()
-end, 0.7)
-
-print("[farm v2] step5 - loops running")
-
--- ================================================================
--- UI - plain ScreenGui, zero external loads
--- ================================================================
-local ui
-local function buildUI()
-    pcall(function()
-        local old = plr:FindFirstChild("PlayerGui") and plr.PlayerGui:FindFirstChild("BIOSYN_Farm")
-        if old then old:Destroy() end
-        if game.CoreGui then
-            local oldCore = game.CoreGui:FindFirstChild("BIOSYN_Farm")
-            if oldCore then oldCore:Destroy() end
-        end
-    end)
-
-    ui = Instance.new("ScreenGui")
-    ui.Name = "BIOSYN_Farm"
-    pcall(function() ui.Parent = game.CoreGui end)
-    if not ui.Parent then
-        ui.Parent = plr:WaitForChild("PlayerGui")
-    end
-    ui.ResetOnSpawn = false
-    ui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ui.DisplayOrder = 50
-    uiHolder.handle = ui
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 210, 0, 250)
-    frame.Position = UDim2.new(0, 18, 0, 180)
-    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
-    frame.BackgroundTransparency = 0.15
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = ui
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -12, 0, 22)
-    title.Position = UDim2.new(0, 8, 0, 4)
-    title.BackgroundTransparency = 1
-    title.Text = "BIOSYN Auto-Farm (v2)"
-    title.TextColor3 = Color3.fromRGB(255, 190, 60)
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 13
-    title.Parent = frame
-
-    local status = Instance.new("TextLabel")
-    status.Name = "Status"
-    status.Size = UDim2.new(1, -12, 0, 18)
-    status.Position = UDim2.new(0, 8, 0, 26)
-    status.BackgroundTransparency = 1
-    status.Text = "OFF"
-    status.TextColor3 = Color3.fromRGB(200, 200, 200)
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 11
-    status.Parent = frame
-
-    local function makeButton(y, label, cb)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.new(1, -16, 0, 26)
-        b.Position = UDim2.new(0, 8, 0, y)
-        b.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-        b.BorderSizePixel = 0
-        b.Text = label
-        b.TextColor3 = Color3.fromRGB(235, 235, 235)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 12
-        b.Parent = frame
-        local c2 = Instance.new("UICorner")
-        c2.CornerRadius = UDim.new(0, 6)
-        c2.Parent = b
-        b.MouseButton1Click:Connect(cb)
-        return b
-    end
-
-    -- dropdown rows: difficulty / map / versus - selections feed the vote
-    -- auto-clicker (voteTick matches the real vote button text)
-    local openDropdown = nil
-    local function makeDropdown(y, labelText, options, displayLabel, onChange)
-        local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(0, 60, 0, 24)
-        lbl.Position = UDim2.new(0, 8, 0, y)
-        lbl.BackgroundTransparency = 1
-        lbl.Text = labelText
-        lbl.TextColor3 = Color3.fromRGB(170, 170, 170)
-        lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Font = Enum.Font.Gotham
-        lbl.TextSize = 11
-        lbl.Parent = frame
-
-        local valueBtn = Instance.new("TextButton")
-        valueBtn.Size = UDim2.new(0, 130, 0, 24)
-        valueBtn.Position = UDim2.new(0, 72, 0, y)
-        valueBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-        valueBtn.BorderSizePixel = 0
-        valueBtn.Text = displayLabel
-        valueBtn.TextColor3 = Color3.fromRGB(235, 235, 235)
-        valueBtn.Font = Enum.Font.GothamBold
-        valueBtn.TextSize = 11
-        valueBtn.TextTruncate = Enum.TextTruncate.AtEnd
-        valueBtn.ZIndex = 3
-        valueBtn.Parent = frame
-        local vc = Instance.new("UICorner")
-        vc.CornerRadius = UDim.new(0, 5)
-        vc.Parent = valueBtn
-
-        local list = Instance.new("Frame")
-        list.Size = UDim2.new(0, 130, 0, #options * 22)
-        list.Position = UDim2.new(0, 72, 0, y + 26)
-        list.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-        list.BorderSizePixel = 0
-        list.Visible = false
-        list.ZIndex = 20
-        list.Parent = frame
-        local lc = Instance.new("UICorner")
-        lc.CornerRadius = UDim.new(0, 5)
-        lc.Parent = list
-
-        valueBtn.MouseButton1Click:Connect(function()
-            if openDropdown and openDropdown ~= list then
-                openDropdown.Visible = false
-            end
-            list.Visible = not list.Visible
-            openDropdown = list.Visible and list or nil
+    for i = #espHighlights, 1, -1 do
+        local h = espHighlights[i]
+        local dead = false
+        pcall(function()
+            dead = (not h.Parent) or (not h.Adornee) or (not h.Adornee.Parent)
         end)
+        if dead then
+            pcall(function() h:Destroy() end)
+            table.remove(espHighlights, i)
+        end
+    end
 
-        for i, opt in ipairs(options) do
-            local o = Instance.new("TextButton")
-            o.Size = UDim2.new(1, -4, 0, 20)
-            o.Position = UDim2.new(0, 2, 0, (i - 1) * 22)
-            o.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
-            o.BorderSizePixel = 0
-            o.Text = opt.label
-            o.TextColor3 = Color3.fromRGB(225, 225, 225)
-            o.Font = Enum.Font.Gotham
-            o.TextSize = 11
-            o.TextXAlignment = Enum.TextXAlignment.Left
-            o.ZIndex = 22
-            o.Parent = list
-            local oc = Instance.new("UICorner")
-            oc.CornerRadius = UDim.new(0, 4)
-            oc.Parent = o
-            local pad = Instance.new("UIPadding")
-            pad.PaddingLeft = UDim.new(0, 7)
-            pad.Parent = o
-            o.MouseButton1Click:Connect(function()
-                valueBtn.Text = opt.label
-                onChange(opt.value)
-                list.Visible = false
-                openDropdown = nil
+    for _, enemy in ipairs(enemies) do
+        local hasHighlight = false
+        for _, h in ipairs(espHighlights) do
+            if h.Adornee == enemy then
+                hasHighlight = true
+                break
+            end
+        end
+        if not hasHighlight then
+            local highlight = Instance.new("Highlight")
+            highlight.FillTransparency = 1
+            highlight.OutlineColor = Color3.fromRGB(255, 0, 0)
+            highlight.OutlineTransparency = 0
+            highlight.Adornee = enemy
+            highlight.Parent = enemy
+            table.insert(espHighlights, highlight)
+        end
+    end
+end
+
+local function setESP(state)
+    espEnabled = state
+    if state then
+        if not espLoopRunning then
+            espLoopRunning = true
+            task.spawn(function()
+                while espEnabled do
+                    pcall(updateESP)
+                    sleepWhile(function() return espEnabled end, 0.75)
+                end
+                espLoopRunning = false
+                pcall(updateESP)
+            end)
+        end
+    else
+        pcall(updateESP) -- clears highlights immediately
+    end
+end
+_G.BIOSYN_SETESP = setESP
+
+-- ================================================================
+-- AUTO DODGE — walks you out of telegraphed blasts (nukes, bombs,
+-- mortar strikes, AOEs) that are marked on the ground near you.
+-- - No key presses: uses the Humanoid's own MoveTo (no ability use).
+-- - Cheap proximity query only (GetPartBoundsInRadius, no workspace
+--   sweeps, StreamingEnabled-safe).
+-- - Only reacts to real telegraph candidates: name matches the warn
+--   words AND the part is non-colliding FX (static map props like
+--   ExplosiveCrates / ArmoredBlastDoor are solid and skipped, so no
+--   constant running away from crates).
+-- - Radius = "Radius"/"BlastRadius" attribute when present, else the
+--   part footprint + a safety margin. It re-issues the escape move
+--   while the marker persists and idles again when it is gone.
+-- ================================================================
+local dodgeOn = false
+local dodgeLoopRunning = false
+local DODGE_KEYWORDS = { "nuke", "warn", "telegraph", "blast", "expl", "aoe",
+    "bomb", "mortar", "missile", "grenade", "shell", "strike" }
+local DODGE_SKIP_NAMES = { "explosivecrates", "blastdoor", "crate", "door" }
+
+local function telegraphRadius(p)
+    local r = p:GetAttribute("Radius") or p:GetAttribute("BlastRadius")
+    if type(r) == "number" and r > 0 then return r + 4 end
+    return math.max(p.Size.X, p.Size.Z) / 2 + 4
+end
+
+local function dodgeStep()
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and hum.Health > 0 and hrp) then return end
+    local okParts, parts = pcall(function()
+        return workspace:GetPartBoundsInRadius(hrp.Position, 70)
+    end)
+    if not okParts or not parts then return end
+
+    local closest, closestPriority = nil, nil
+    for _, p in ipairs(parts) do
+        if p:IsA("BasePart") and not p:IsDescendantOf(char) then
+            local namel = string.lower(p.Name)
+            local par = p.Parent
+            local parname = par and string.lower(par.Name) or ""
+            local bad = false
+            for _, s in ipairs(DODGE_SKIP_NAMES) do
+                if namel:find(s, 1, true) or parname:find(s, 1, true) then
+                    bad = true break
+                end
+            end
+            if not bad and not p.CanCollide then
+                local keywordHit = false
+                for _, k in ipairs(DODGE_KEYWORDS) do
+                    if namel:find(k, 1, true) or parname:find(k, 1, true) then
+                        keywordHit = true break
+                    end
+                end
+                if keywordHit then
+                    local radius = telegraphRadius(p)
+                    local dist = (p.Position - hrp.Position).Magnitude
+                    if dist < radius then
+                        local priority = radius - dist
+                        if not closestPriority or priority > closestPriority then
+                            closest, closestPriority = p, priority
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local tele = closest
+    if not tele then return end
+    local radius = telegraphRadius(tele)
+    local away = hrp.Position - tele.Position
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 2 then
+        away = Vector3.new(1, 0, 0)
+    else
+        away = away.Unit
+    end
+    local safe = tele.Position + away * (radius + 6)
+    pcall(function() hum:MoveTo(safe) end)
+end
+
+local function setDodge(state)
+    dodgeOn = state
+    if state and not dodgeLoopRunning then
+        dodgeLoopRunning = true
+        task.spawn(function()
+            while dodgeOn do
+                if charAlive() then
+                    pcall(dodgeStep)
+                    sleepWhile(function() return dodgeOn end, 0.2, 0.05)
+                else
+                    sleepWhile(function() return dodgeOn end, 0.5, 0.05)
+                end
+            end
+            dodgeLoopRunning = false
+        end)
+    end
+end
+_G.BIOSYN_SETDODGE = setDodge
+
+combatTab:label{ Text = "🛡️ Auto Dodge", Description = "Walks you out of telegraphed blasts (nukes etc.)" }
+combatTab:toggle{
+    Name = "☢️ Dodge Blasts",
+    Description = "Auto-move from warning zones under/near you",
+    StartingState = true,
+    Callback = setDodge,
+}
+
+visualsTab:label{ Text = "👁️ Visuals", Description = "See enemies through walls" }
+visualsTab:toggle{
+    Name = "Enemy ESP",
+    Description = "Highlights all enemies",
+    StartingState = false,
+    Callback = setESP,
+}
+
+-- ================================================================
+-- TANZANITE AXE TAB (native)
+-- The old toggles loaded MoonSec-obfuscated remote scripts that now
+-- die instantly inside their VM: "attempt to index nil with 'Main'".
+-- These use the axe's own client protocol instead (verified live):
+--   SWING:   Main:FireServer("SWING", {})
+--   DAMAGE:  Main:FireServer("DAMAGE", { enemyModel })
+--   CHARGE:  Main:FireServer("CHARGE", { seconds })   (2..8)
+--   5th combo: Main:FireServer("AxeExplode", {})
+-- Enemies come from CollectionService tags "Tango"/"Monster"
+-- (what the axe itself targets). Server accepted DAMAGE from 700+
+-- studs away, so no distance gating is needed.
+-- ================================================================
+local CollectionService = game:GetService("CollectionService")
+
+local function getCharAxe()
+    local char = plr.Character
+    if not char then return nil end
+    -- Tanzanite Axe first, then any other axe variant
+    local a = char:FindFirstChild("Tanzanite Axe")
+    if a then return a end
+    local held = char:FindFirstChildOfClass("Tool")
+    if held and held.Name:find("Axe", 1, true) then return held end
+    return nil
+end
+
+-- enemies via the same tags the axe's own client scans
+-- PERMANENT RULE: sorted by distance to the generator (falls back to
+-- player distance only on maps without one). The "dist" field stays
+-- = distance to PLAYER (used by the close-swing check below).
+local function collectTargets(tags)
+    local char = plr.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    ensureGenerator()
+    local out = {}
+    for _, tag in ipairs(tags) do
+        for _, m in ipairs(CollectionService:GetTagged(tag)) do
+            local root = m:FindFirstChild("HumanoidRootPart")
+            local hum = m:FindFirstChild("Humanoid")
+            if root and hum and hum.Health > 0 and not (m:GetAttribute("HitByClient") or false) and not isPlayerOwned(m) then
+                table.insert(out, {
+                    model = m,
+                    dist = hrp and (root.Position - hrp.Position).Magnitude or 9e9,
+                    gen = generatorPos and (root.Position - generatorPos).Magnitude or nil,
+                })
+            end
+        end
+    end
+    if generatorPos and #out > 0 then
+        table.sort(out, function(a, b) return a.gen < b.gen end)
+    else
+        table.sort(out, function(a, b)
+            return a.dist < b.dist
+        end)
+    end
+    return out
+end
+
+-- one aura cycle (measured live: constant 2.0s cycle keeps swings accepted):
+--  - close target  -> real tool:Activate() swing (free, no meter usage)
+--  - far targets   -> raw SWING + DAMAGE + AxeExplode packets (accepted at
+--    any distance by the server)
+-- the aura never teleports or moves you.
+local function axeAuraCycle(tags)
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (hum and hum.Health > 0) then return end
+    local axe = getCharAxe()
+    if not axe then
+        -- auto-equip from the backpack (Tanzanite Axe, then any Axe variant)
+        local bp = plr:FindFirstChildOfClass("Backpack")
+        local a2 = bp and (bp:FindFirstChild("Tanzanite Axe") or bp:FindFirstChild("Axe"))
+        if a2 then pcall(function() hum:EquipTool(a2) end) end
+        return
+    end
+    if not axe:FindFirstChild("Main") then return end
+    if (axe:GetAttribute("Uses") or 0) <= 0 then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local targets = collectTargets(tags)
+    if #targets == 0 then return end
+
+    -- close range: actual swing, always works
+    if targets[1].dist <= (axe:GetAttribute("Range") or 10) + 2 then
+        pcall(function() axe:Activate() end)
+        task.wait(0.9)
+        return
+    end
+
+    -- far: raw packets, keeps whole map reachable
+    local maxTargets = axe:GetAttribute("MaxTargets") or 3
+    local chosen = {}
+    for i = 1, math.min(maxTargets, #targets) do
+        table.insert(chosen, targets[i])
+    end
+    local mainEvent = axe:FindFirstChild("Main")
+    mainEvent:FireServer("SWING", {})
+    task.wait(0.07)
+    for _, t in ipairs(chosen) do
+        if t.model.Parent then
+            pcall(function()
+                mainEvent:FireServer("DAMAGE", { t.model })
             end)
         end
     end
-
-    makeDropdown(84, "DIFF", {
-        { label = "Auto", value = "Auto" },
-        { label = "Easy", value = "Easy" },
-        { label = "Medium", value = "Medium" },
-        { label = "Brutal (35+)", value = "Brutal" },
-    }, cfg.difficulty, function(v)
-        cfg.difficulty = v
-        saveCfg()
-        print("[farm v2] vote cfg: diff=" .. cfg.difficulty .. " map=" .. cfg.map .. " versus=" .. cfg.versus)
+    pcall(function()
+        mainEvent:FireServer("AxeExplode", {})
     end)
+end
 
-    makeDropdown(110, "MAP", {
-        { label = "Any", value = "Any" },
-        { label = "Classic (354)", value = "354" },
-        { label = "Forest", value = "Forest" },
-        { label = "Desert", value = "Desert" },
-    }, cfg.map == "354" and "Classic (354)" or cfg.map, function(v)
-        cfg.map = v
-        saveCfg()
-        print("[farm v2] vote cfg: diff=" .. cfg.difficulty .. " map=" .. cfg.map .. " versus=" .. cfg.versus)
-    end)
-
-    makeDropdown(136, "VERSUS", {
-        { label = "Any", value = "Any" },
-        { label = "On", value = "On" },
-        { label = "Off", value = "Off" },
-    }, cfg.versus, function(v)
-        cfg.versus = v
-        saveCfg()
-        print("[farm v2] vote cfg: diff=" .. cfg.difficulty .. " map=" .. cfg.map .. " versus=" .. cfg.versus)
-    end)
-
-    makeDropdown(162, "ALLY", {
-        { label = "GOC", value = "GOC" },
-        { label = "MCD (Marshall, Carter & Dark)", value = "MCD" },
-        { label = "UIU", value = "UIU" },
-        { label = "No allies", value = "None" },
-        { label = "Leave to me", value = "Any" },
-    }, cfg.ally, function(v)
-        cfg.ally = v
-        saveCfg()
-        print("[farm v2] ALLY vote faction: " .. v)
-    end)
-
-    makeDropdown(188, "DEATHWISH", {
-        { label = "Any (manual)", value = "Any" },
-        { label = "On", value = "On" },
-        { label = "Off (Classic Brutal)", value = "Off" },
-    }, cfg.deathwish, function(v)
-        cfg.deathwish = v
-        saveCfg()
-        print("[farm v2] DEATH WISH vote: " .. v)
-    end)
-
-    local toggleBtn
-    toggleBtn = makeButton(50, "START FARM", function()
-        farmOn = not farmOn
-        getgenv().BIOSYN_FARM_AUTORESUME = farmOn
-        toggleBtn.Text = farmOn and "STOP FARM" or "START FARM"
-        toggleBtn.BackgroundColor3 = farmOn and Color3.fromRGB(50, 88, 50) or Color3.fromRGB(35, 35, 42)
-        status.Text = farmOn and ("RUNNING | shots " .. stats.shots) or "OFF"
-        print("[farm v2] Auto-Farm " .. (farmOn and "ON" or "OFF"))
-    end)
-
-    -- keep the button face in sync when auto-resume boots the farm ON
-    if farmOn then
-        toggleBtn.Text = "STOP FARM"
-        toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 88, 50)
-        status.Text = "RUNNING | shots " .. stats.shots
-    end
-
-    makeButton(216, "Print status", function()
-        print("[farm v2] deploys=" .. stats.deploys .. " deaths=" .. stats.deaths ..
-            " shots=" .. stats.shots .. " ammoClaims=" .. stats.claims ..
-            " cardPicks=" .. stats.picks .. " streakResets=" .. stats.resets ..
-            " | streak now=" .. getStreak() .. "/" .. RESET_STREAK ..
-            " | cfg: diff=" .. cfg.difficulty .. " map=" .. cfg.map .. " versus=" .. cfg.versus ..
-            " ally=" .. cfg.ally)
-    end)
-
+local function startAuraLoop(getState, tags, label)
     task.spawn(function()
-        while genv.BIOSYN_FARM_RUN_ID == RUN_ID and ui and ui.Parent do
-            if farmOn then
-                status.Text = string.format("RUNNING | shots %d | streak %d", stats.shots, getStreak())
+        while getState() do
+            local ok, err = pcall(axeAuraCycle, tags)
+            if not ok then
+                warn("[notveryuhq] " .. label .. " error: " .. tostring(err))
             end
-            task.wait(1)
+            sleepWhile(getState, 0.45)  -- ~1 swing / 0.9s (in-game Cooldown is 0.8)
         end
     end)
 end
 
-buildUI()
+local infChargeRunning = false
 
-genv.BIOSYN_FARM = {
-    toggle = function(force)
-        farmOn = (force == nil) and (not farmOn) or force
-        getgenv().BIOSYN_FARM_AUTORESUME = farmOn
-        print("[farm v2] Auto-Farm " .. (farmOn and "ON" or "OFF"))
-        return farmOn
-    end,
-    state = function()
-        return {
-            on = farmOn, build = "farm_v2",
-            deploys = stats.deploys, deaths = stats.deaths,
-            shots = stats.shots, claims = stats.claims,
-            picks = stats.picks, resets = stats.resets,
-            streak = getStreak(),
-            diff = cfg.difficulty, map = cfg.map, versus = cfg.versus, ally = cfg.ally,
-        }
-    end,
-    setVote = function(diff, versus, map, ally)
-        cfg.difficulty = diff or cfg.difficulty
-        cfg.versus = versus or cfg.versus
-        cfg.map = map or cfg.map
-        cfg.ally = ally or cfg.ally
-        print("[farm v2] vote cfg: diff=" .. cfg.difficulty .. " vs=" .. cfg.versus
-            .. " map=" .. cfg.map .. " ally=" .. cfg.ally)
-    end,
-    setReset = function(n)
-        RESET_STREAK = tonumber(n) or RESET_STREAK
-        print("[farm v2] streak auto-reset at " .. RESET_STREAK)
-    end,
-    setRate = function(n)
-        cfg.attackRate = math.max(0.05, tonumber(n) or 0.15)
-        print("[farm v2] attack rate set to " .. cfg.attackRate .. "s - reload to apply")
+combatTab:label{ Text = "🪓 Tanzanite Axe", Description = "Axe charge + kill aura (native)" }
+combatTab:toggle{
+    Name = "⚡ Infinite Charge",
+    Description = "Instantly re-charges the axe when possible",
+    StartingState = false,
+    Callback = function(state)
+        infChargeRunning = state
+        print("[✓] Tanzanite Axe Inf Charge: " .. (state and "ENABLED" or "DISABLED"))
+        if state then
+            task.spawn(function()
+                while infChargeRunning do
+                    pcall(function()
+                        local axe = getCharAxe()
+                        local main = axe and axe:FindFirstChild("Main")
+                        if axe and main
+                            and not axe:GetAttribute("Charged")
+                            and not axe:GetAttribute("IsChargeCooldown") then
+                            main:FireServer("CHARGE", { 8 })
+                        end
+                    end)
+                    sleepWhile(function() return infChargeRunning end, 1.0)
+                end
+            end)
+        end
     end,
 }
 
--- Lynx: getgenv() and _G are different tables - expose the API through
--- _G as well so probes / manual calls always work
-_G.BIOSYN_FARM = genv.BIOSYN_FARM
+local allAuraRunning = false
 
-print("[farm v2] loaded - UI built, use START FARM or _G.BIOSYN_FARM.toggle(true)")
+combatTab:toggle{
+    Name = "💀 Kill All",
+    Description = "Kill Tango + Monsters at once (native)",
+    StartingState = false,
+    Callback = function(state)
+        if state and not allAuraRunning then
+            allAuraRunning = true
+            print("[✓] Kill All Aura: ENABLED")
+            startAuraLoop(function() return allAuraRunning end, { "Tango", "Monster" }, "Kill All aura")
+        elseif not state and allAuraRunning then
+            allAuraRunning = false
+            print("[✓] Kill All Aura: DISABLED")
+        end
+    end,
+}
+
+-- ================================================================
+-- UTILITY BUTTONS
+-- ================================================================
+miscTab:label{ Text = "🛠️ Utility", Description = "Server + character tools" }
+miscTab:button{
+    Name = "💀 Reset Char",
+    Description = "Respawns you",
+    Callback = function()
+        local char = plr.Character
+        if char then
+            char:BreakJoints()
+        end
+    end,
+}
+
+miscTab:button{
+    Name = "Rejoin Server",
+    Description = "Leaves and rejoins",
+    Callback = function()
+        game:GetService("TeleportService"):Teleport(game.PlaceId)
+    end,
+}
+
+-- ================================================================
+-- INFO
+-- ================================================================
+miscTab:label{ Text = "⌨️ K = show / hide hub" }
+miscTab:label{ Text = "📱 Tap the ⬡ button (top-right) to show/hide hub • hold + move to drag it" }
+miscTab:label{ Text = "📱 Drag the top bar to move" }
+
+-- ================================================================
+-- MOBILE SHOW/HIDE BUTTON — floating button that toggles the hub
+-- window; works on touch AND mouse (tap or click).
+-- ================================================================
+task.spawn(function()
+    local UserInputService = game:GetService("UserInputService")
+
+    -- remove toggle buttons from previous runs (no duplicates)
+    pcall(function()
+        local containers = {}
+        local okHui, hui = pcall(function() return gethui and gethui() end)
+        if okHui and hui then table.insert(containers, hui) end
+        pcall(function() table.insert(containers, game:GetService("CoreGui")) end)
+        table.insert(containers, plr:FindFirstChild("PlayerGui"))
+        for _, container in ipairs(containers) do
+            if container then
+                for _, gui in ipairs(container:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui.Name == "BIOSYN_MobileToggle" then
+                        gui:Destroy()
+                    end
+                end
+            end
+        end
+    end)
+
+    -- Mercury wraps its window in a tweened "core" frame controlled by
+    -- window:show(state) — that's the same path its own K keybind uses.
+    local hubVisible = true      -- window starts visible
+
+    local function toggleHub()
+        hubVisible = not hubVisible
+        pcall(function()
+            window:show(hubVisible)
+        end)
+    end
+    _G.BIOSYN_TOGGLE = function(force)
+        if force == nil then force = not hubVisible end
+        hubVisible = force
+        pcall(function()
+            window:show(hubVisible)
+        end)
+        return hubVisible
+    end
+
+    -- floating button (parented to a CoreGui holder so the game cannot delete it)
+    local holderOk, holder = pcall(function()
+        local okHui, hui = pcall(function() return gethui and gethui() end)
+        return (okHui and hui) or game:GetService("CoreGui")
+    end)
+    if not holderOk or not holder then holder = plr:FindFirstChild("PlayerGui") end
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "BIOSYN_MobileToggle"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.DisplayOrder = 999999
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "ToggleHub"
+    btn.Text = "⬡"
+    btn.TextSize = 26
+    btn.Font = Enum.Font.GothamBold
+    btn.TextColor3 = Color3.fromRGB(235, 235, 255)
+    btn.BackgroundColor3 = Color3.fromRGB(35, 30, 55)
+    btn.BackgroundTransparency = 0.15
+    btn.Size = UDim2.fromOffset(56, 56)
+    btn.Position = UDim2.new(1, -66, 0, 66)      -- top-right, thumb friendly
+    btn.Active = true
+    btn.Visible = true                           -- always visible (mouse + touch)
+    screen.Parent = holder
+    btn.Parent = screen
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = btn
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(150, 120, 255)
+    stroke.Thickness = 2
+    stroke.Parent = btn
+
+    -- tap/click = toggle; drag = move 1:1 with the cursor.
+    -- FIX: the old math mixed two coordinate spaces (input position vs the
+    -- gui's own offset space — the hidden UI container shifts our gui
+    -- vertically), so the button TELEPORTED toward the wrong corner the
+    -- moment a drag started. Every move is now anchored to the button's
+    -- live AbsolutePosition + this event's Delta, then clamped to the
+    -- viewport: it follows the cursor exactly and can never leave screen.
+    local dragging = false
+    local dragMoved = false
+    local pressInput
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragMoved = false
+            pressInput = Vector2.new(input.Position.X, input.Position.Y)
+        end
+    end)
+    btn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging and not dragMoved then
+                _G.BIOSYN_TOGGLE()
+            end
+            dragging = false
+            pressInput = nil
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not (dragging and pressInput and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch)) then
+            return
+        end
+        -- dead zone: anything within 8px of the press counts as a click
+        if not dragMoved then
+            if (Vector2.new(input.Position.X, input.Position.Y) - pressInput).Magnitude > 8 then
+                dragMoved = true
+            else
+                return
+            end
+        end
+        if dragMoved then
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+            if vp.X > 200 and vp.Y > 200 then
+                local abs = btn.AbsolutePosition
+                local size = btn.AbsoluteSize
+                local nx = math.clamp(abs.X + input.Delta.X, 8, vp.X - size.X - 8)
+                local ny = math.clamp(abs.Y + input.Delta.Y, 8, vp.Y - size.Y - 8)
+                btn.Position = UDim2.fromOffset(nx - screen.AbsolutePosition.X, ny - screen.AbsolutePosition.Y)
+            end
+        end
+    end)
+
+    -- Mercury's own K keybind keeps working; keep our flag in sync
+    pcall(function()
+        UserInputService.InputBegan:Connect(function(input, gp)
+            if gp then return end
+            if input.KeyCode == Enum.KeyCode.K then
+                hubVisible = not hubVisible
+            end
+        end)
+    end)
+
+    print("[✓] ⬡ toggle: ready (tap/click to show/hide hub)")
+end)
+
+-- remote control / diagnostics (lets tools toggle features without the UI)
+_G.BIOSYN = {
+    setSilentAim = setSilentAim,
+    setKillClosest = setKillClosest,
+    setCombat = setCombat,
+    setESP = setESP,
+    state = function()
+        return {
+            instantPrompt = instantPromptStatus,
+            silent = silentAimOn,
+            silentLoop = silentAimLoop,
+            kill = killClosestOn,
+            killLoop = killClosestLoop,
+            esp = espEnabled,
+            shots = { silent = shotCount.silent, kill = shotCount.kill },
+            build = 22,
+        }
+    end,
+}
