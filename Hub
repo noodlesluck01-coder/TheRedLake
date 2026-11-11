@@ -260,75 +260,143 @@ end)
 -- ================================================================
 -- GENERATOR TARGETING (permanent rule, no toggle button)
 -- Every target pick (silent aim, kill closest, axe aura) ranks
--- enemies by their distance to THE GENERATOR — the thing enemies
--- actually attack. The generator is auto-found on every map; when a
--- map has none, everything silently falls back to closest-to-player.
+-- enemies by their distance to the NEAREST GENERATOR - the thing
+-- enemies actually attack. Verified live: each map spawns its own
+-- Generator model as a direct workspace child (Classic + Forest both
+-- preload one), so anchors are exact-name "Generator" models filtered
+-- to the ACTIVE map (RS.Map.ObjectValue), with the active map's
+-- GeneratorSpot/GeneratorDefense slots as fallback before the round
+-- deploys them. No generator anywhere -> closest-to-player fallback.
+-- Works on every map: numbered variants (Generator1/gen2) included,
+-- nested-folder spawns found by a bounded deep sweep, mid-round
+-- spawns caught by ChildAdded.
 -- ================================================================
-local generatorRef = nil
-local generatorPos = nil
-local findFailedAt = nil
+local genAnchors = {}
+local genAnchorAt = 0
+local genAnchorSig = nil
 
-local function findGenerator()
-    -- fast path known for this game: Workspace.GeneratorFolder.GeneratorPart
-    local folder = workspace:FindFirstChild("GeneratorFolder")
-    if folder then
-        local part = folder:FindFirstChild("GeneratorPart")
-        if part and part:IsA("BasePart") then
-            generatorRef, generatorPos = part, part.Position
-            return true
-        end
-        local any = folder:FindFirstChildWhichIsA("BasePart", true)
-        if any then
-            generatorRef, generatorPos = any, any.Position
-            return true
+local function genAnchorPos(a)
+    if a:IsA("BasePart") then
+        return a.Position
+    end
+    local ok, p = pcall(a.GetPivot, a)
+    if ok and p then return p.Position end
+    return nil
+end
+
+local function collectGenAnchors()
+    if tick() - genAnchorAt < 2 then return genAnchors end
+    genAnchorAt = tick()
+    genAnchors = {}
+    local spots = {}
+    local seen = {}
+    -- anchored patterns keep FX/slots out: GeneratorDangerFx,
+    -- generatorPuddle, GeneratorSpot, GeneratorDefense, GeneratorFolder
+    local function consider(inst)
+        if not (inst:IsA("BasePart") or inst:IsA("Model")) or seen[inst] then return end
+        local n = string.lower(inst.Name)
+        if n == "generator" or n:match("^gen%d+$") or n:match("^generator%d+$") then
+            seen[inst] = true
+            table.insert(genAnchors, inst)
         end
     end
-    -- generic fallback: any generator-named part/model in the map
-    local now = tick()
-    if findFailedAt and (now - findFailedAt) < 10 then
-        return generatorRef ~= nil   -- don't rescan the whole map constantly after a miss
-    end
-    for _, d in ipairs(workspace:GetDescendants()) do
-        local ln = string.lower(d.Name)
-        if ln:find("generator", 1, true)
-            and (d:IsA("BasePart") or d:IsA("Model"))
-            and ln:find("danger", 1, true) == nil
-            and ln:find("manager", 1, true) == nil then
-            if d:IsA("BasePart") then
-                generatorRef, generatorPos = d, d.Position
-                break
-            elseif d:IsA("Model") then
-                local p = d:FindFirstChildWhichIsA("BasePart")
-                if p then
-                    generatorRef, generatorPos = p, p.Position
-                    break
+    pcall(function()
+        for _, d in ipairs(workspace:GetChildren()) do
+            consider(d)
+            if string.lower(d.Name) == "generatorfolder" and d:IsA("Model") then
+                for _, dd in ipairs(d:GetChildren()) do consider(dd) end
+            end
+        end
+        local mv = game:GetService("ReplicatedStorage"):FindFirstChild("Map")
+        local active = mv and typeof(mv.Value) == "Instance" and mv.Value or nil
+        if active then
+            for _, d in ipairs(active:GetChildren()) do
+                consider(d)
+                local ln = string.lower(d.Name)
+                if ln == "generatorspot" or ln == "generatordefense" then
+                    seen[d] = true
+                    table.insert(spots, d)
+                end
+            end
+            -- other maps preload a live Generator alongside the active one:
+            -- keep only anchors near the ACTIVE map's own slots
+            if #spots > 0 and #genAnchors > 0 then
+                local kept = {}
+                for _, a in ipairs(genAnchors) do
+                    local ap = genAnchorPos(a)
+                    if not ap then
+                        table.insert(kept, a)
+                    else
+                        for _, s in ipairs(spots) do
+                            local sp = genAnchorPos(s)
+                            if sp and (ap - sp).Magnitude < 500 then
+                                table.insert(kept, a)
+                                break
+                            end
+                        end
+                    end
+                end
+                if #kept > 0 then genAnchors = kept end
+            end
+            -- maps that spawn generators mid-round into nested folders
+            -- (Desert/Chaos Facility/Shadow War carry empty "Generated"
+            -- folders until the round starts): bounded deep sweep
+            if #genAnchors == 0 then
+                local count = 0
+                for _, d in ipairs(active:GetDescendants()) do
+                    count = count + 1
+                    if count > 30000 then break end
+                    consider(d)
                 end
             end
         end
+    end)
+    if #genAnchors == 0 and #spots > 0 then
+        genAnchors = spots
     end
-    if not generatorRef then
-        findFailedAt = now
-        return false
+    local sig = #genAnchors .. "|" .. tostring(genAnchors[1] and genAnchors[1].Name or "")
+    if #genAnchors > 0 and sig ~= genAnchorSig then
+        print("[✓] Generator targeting: " .. #genAnchors .. " anchors (" .. sig .. ")")
     end
-    return true
+    genAnchorSig = sig
+    return genAnchors
 end
 
--- make sure the reference is still valid (maps get replaced/destroyed)
+-- distance from a position to the nearest generator anchor (nil = none)
+local function nearestGenDist(pos)
+    local anchors = collectGenAnchors()
+    if #anchors == 0 or not pos then return nil end
+    local best = math.huge
+    for _, a in ipairs(anchors) do
+        local ap = genAnchorPos(a)
+        if ap then
+            local d = (pos - ap).Magnitude
+            if d < best then best = d end
+        end
+    end
+    if best == math.huge then return nil end
+    return best
+end
+
+-- kept for the existing call sites: refresh the anchor cache
 local function ensureGenerator()
-    if not generatorRef or not generatorRef.Parent then
-        generatorRef, generatorPos = nil, nil
-        findGenerator()
-    end
+    collectGenAnchors()
 end
 
--- new map spawned: a fresh GeneratorFolder appears — notice it cheaply
+-- new objective appears mid-round: live Generator models spawn as direct
+-- workspace children, GeneratorFolder re-appears on map swaps - either
+-- way force the next collect instead of waiting out the 2s cache
 workspace.ChildAdded:Connect(function(child)
-    if child.Name == "GeneratorFolder" then
-        findGenerator()
+    local ln = string.lower(child.Name)
+    if ln == "generatorfolder" or ln == "generator"
+        or ln:match("^gen%d+$") or ln:match("^generator%d+$") then
+        genAnchorAt = 0
     end
 end)
-findGenerator()
-print("[✓] Generator targeting: " .. (generatorRef and ("on (" .. tostring(math.floor(generatorPos.X)) .. ", " .. tostring(math.floor(generatorPos.Y)) .. ", " .. tostring(math.floor(generatorPos.Z)) .. ")") or "no generator on this map yet — will auto-find"))
+collectGenAnchors()
+print("[✓] Generator targeting: " .. (#genAnchors > 0
+    and ("on - " .. #genAnchors .. " anchor(s)")
+    or "no generator on this map yet - will auto-find"))
 
 -- ================================================================
 -- FRIENDLY-FIRE GUARD (permanent) — players are NEVER targets.
@@ -458,10 +526,11 @@ local function getclosestenemy()
     for _, k in ipairs(enemies) do
         local targetHrp = k:FindFirstChild("HumanoidRootPart")
         if targetHrp then
-            local key
-            if generatorPos then
-                -- PERMANENT RULE: rank by distance to the generator
-                key = (targetHrp.Position - generatorPos).Magnitude
+            local key = nearestGenDist(targetHrp.Position)
+            if key then
+                -- PERMANENT RULE: rank by distance to the nearest generator
+                -- (tiny player-distance tie-break for equal cases)
+                key = key + (playerPos and (targetHrp.Position - playerPos).Magnitude or 0) * 0.001
             elseif playerPos then
                 -- no generator on this map: closest to player
                 key = (targetHrp.Position - playerPos).Magnitude
@@ -776,13 +845,13 @@ local function collectTargets(tags)
                 table.insert(out, {
                     model = m,
                     dist = hrp and (root.Position - hrp.Position).Magnitude or 9e9,
-                    gen = generatorPos and (root.Position - generatorPos).Magnitude or nil,
+                    gen = nearestGenDist(root.Position),
                 })
             end
         end
     end
-    if generatorPos and #out > 0 then
-        table.sort(out, function(a, b) return a.gen < b.gen end)
+    if #out > 0 and out[1].gen ~= nil then
+        table.sort(out, function(a, b) return (a.gen or 9e9) < (b.gen or 9e9) end)
     else
         table.sort(out, function(a, b)
             return a.dist < b.dist
